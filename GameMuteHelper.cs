@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("3.3.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.3.1.0")]
 
 namespace GameMuteHelper
 {
@@ -86,7 +86,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.3 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.3.1 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -959,10 +959,15 @@ namespace GameMuteHelper
 
         private class Worker
         {
+            public int Pid;
             public IntPtr Handle;
             public int Fps;
             public ManualResetEvent Stop;
             public Thread Thread;
+            public bool Failed;
+            public int LastStatus;
+            public DateTime RetryAfterUtc;
+            public bool LoggedOk;
         }
 
         private static readonly Dictionary<int, Worker> Workers = new Dictionary<int, Worker>();
@@ -979,14 +984,21 @@ namespace GameMuteHelper
                 Worker w;
                 if (Workers.TryGetValue(pid, out w))
                 {
-                    if (w.Fps == fps) return true;
+                    if (!w.Failed && w.Fps == fps) return true;
+                    if (w.Failed && DateTime.UtcNow < w.RetryAfterUtc) return false;
                     StopUnlocked(pid);
                 }
 
                 IntPtr h = OpenProcess(ProcessSuspendResume | Synchronize, false, pid);
-                if (h == IntPtr.Zero) return false;
+                if (h == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    AppLogger.Log(string.Format("Suspend OpenProcess failed: pid={0} err={1}", pid, err), "WARN");
+                    return false;
+                }
 
                 w = new Worker();
+                w.Pid = pid;
                 w.Handle = h;
                 w.Fps = fps;
                 w.Stop = new ManualResetEvent(false);
@@ -1009,8 +1021,27 @@ namespace GameMuteHelper
 
             while (!w.Stop.WaitOne(0))
             {
-                if (WaitForSingleObject(w.Handle, 0) == 0) break; // 目标进程已退出
-                if (NtSuspendProcess(w.Handle) != 0) break;
+                if (WaitForSingleObject(w.Handle, 0) == 0)
+                {
+                    w.Failed = true;
+                    w.RetryAfterUtc = DateTime.UtcNow.AddSeconds(30);
+                    break; // 目标进程已退出
+                }
+
+                int st = NtSuspendProcess(w.Handle);
+                if (st != 0)
+                {
+                    w.Failed = true;
+                    w.LastStatus = st;
+                    w.RetryAfterUtc = DateTime.UtcNow.AddSeconds(10);
+                    AppLogger.Log(string.Format("Suspend failed: pid={0} status=0x{1:X8}", w.Pid, st), "WARN");
+                    break;
+                }
+                if (!w.LoggedOk)
+                {
+                    w.LoggedOk = true;
+                    AppLogger.Log(string.Format("Suspend active: pid={0} fps={1}", w.Pid, w.Fps), "INFO");
+                }
 
                 bool stopping = w.Stop.WaitOne(suspend);
                 NtResumeProcess(w.Handle);
@@ -1068,6 +1099,15 @@ namespace GameMuteHelper
         public static bool IsActive(int pid)
         {
             lock (Sync) { return Workers.ContainsKey(pid); }
+        }
+
+        public static bool HasFailed(int pid)
+        {
+            lock (Sync)
+            {
+                Worker w;
+                return Workers.TryGetValue(pid, out w) && w.Failed;
+            }
         }
     }
 
@@ -2882,6 +2922,7 @@ namespace GameMuteHelper
                 uint appliedFps = 0;
                 int appliedCpu = 0;
                 int appliedSuspend = 0;
+                bool suspendFailed = false;
                 string method = LimitMethods.Normalize(rule.Method);
 
                 if (rule.LimitFps && method == LimitMethods.Cpu)
@@ -2927,7 +2968,6 @@ namespace GameMuteHelper
                     if (shouldTrigger)
                     {
                         int started = 0;
-                        int failed = 0;
                         for (int i = 0; i < pids.Count; i++)
                         {
                             bool changed;
@@ -2936,19 +2976,27 @@ namespace GameMuteHelper
                                 started++;
                                 if (changed) SetFooterMessage(string.Format("{0} 切至后台 · 挂起循环 {1} 次/秒", name, suspendFps));
                             }
-                            else
-                            {
-                                failed++;
-                            }
                         }
-                        if (started > 0)
+
+                        bool anyFailed = false;
+                        for (int i = 0; i < pids.Count; i++)
+                        {
+                            if (SuspendCore.HasFailed(pids[i])) anyFailed = true;
+                        }
+
+                        if (started > 0 && !anyFailed)
                         {
                             appliedSuspend = suspendFps;
                             _suspendWarned.Remove(name);
                         }
-                        else if (failed > 0 && _suspendWarned.Add(name))
+                        else
                         {
-                            SetFooterMessage(name + " 挂起失败（可能需要更高权限或被系统保护）");
+                            suspendFailed = true;
+                            if (_suspendWarned.Add(name))
+                            {
+                                SetFooterMessage(name + " 挂起失败：进程可能受反作弊保护，请改用 RTSS 或 CPU 配额");
+                                AppLogger.Log("Suspend unsupported for " + name, "WARN");
+                            }
                         }
                     }
                     else
@@ -2994,6 +3042,8 @@ namespace GameMuteHelper
 
                 if (active)
                     _liveState[name] = "前台";
+                else if (mutedNow && suspendFailed)
+                    _liveState[name] = "静音·挂起失败";
                 else if (mutedNow && appliedSuspend > 0)
                     _liveState[name] = string.Format("静音·挂起{0}", appliedSuspend);
                 else if (mutedNow && appliedCpu > 0)
@@ -3002,6 +3052,8 @@ namespace GameMuteHelper
                     _liveState[name] = string.Format("静音·{0}FPS", appliedFps);
                 else if (mutedNow)
                     _liveState[name] = "已静音";
+                else if (suspendFailed)
+                    _liveState[name] = "挂起失败";
                 else if (appliedSuspend > 0)
                     _liveState[name] = string.Format("挂起 {0}", appliedSuspend);
                 else if (appliedCpu > 0)
