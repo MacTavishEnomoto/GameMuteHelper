@@ -15,6 +15,12 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+[assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
+[assembly: System.Reflection.AssemblyDescription("后台失焦自动静音与 RTSS / CPU 配额限帧助手")]
+[assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
+[assembly: System.Reflection.AssemblyVersion("3.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.2.0.0")]
+
 namespace GameMuteHelper
 {
     // =========================================================================
@@ -69,7 +75,7 @@ namespace GameMuteHelper
                 Application.SetCompatibleTextRenderingDefault(false);
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.1 Light (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.2 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -173,7 +179,7 @@ namespace GameMuteHelper
 
         public ConfigData()
         {
-            Version = "3.1";
+            Version = "3.2";
             DebounceMs = 500;
             LimitMethod = "rtss";
             CpuQuotaPercent = 5;
@@ -249,7 +255,7 @@ namespace GameMuteHelper
         {
             try
             {
-                data.Version = "3.1";
+                data.Version = "3.2";
                 data.Watch = null;
                 data.TargetFps = null;
                 data.LimitFps = null;
