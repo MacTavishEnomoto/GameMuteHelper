@@ -1705,6 +1705,329 @@ namespace GameMuteHelper
         }
     }
 
+    // =========================================================================
+    // 数值微调控件：可点击输入 + 右侧上下箭头（点一下 ±Step，按住持续步进）
+    // 替代「裸 TextBox + 面板转发点击」的脆弱方案
+    // =========================================================================
+    internal class SpinnerInput : Control
+    {
+        private int _value;
+        private int _min = 1;
+        private int _max = 100;
+        private int _step = 5;
+        private string _suffix = "";
+        private bool _hovered;
+        private bool _hoverUp;
+        private bool _hoverDown;
+        private bool _pressedUp;
+        private bool _pressedDown;
+        private bool _editing;
+
+        private System.Windows.Forms.Timer _repeatTimer;
+
+        public event EventHandler ValueChanged;
+        public event EventHandler EditCommitted;
+
+        public int Value
+        {
+            get { return _value; }
+            set
+            {
+                int v = Clamp(value);
+                if (_value == v) return;
+                _value = v;
+                Invalidate();
+                if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+            }
+        }
+
+        public int Minimum
+        {
+            get { return _min; }
+            set { _min = value; _value = Clamp(_value); Invalidate(); }
+        }
+
+        public int Maximum
+        {
+            get { return _max; }
+            set { _max = value; _value = Clamp(_value); Invalidate(); }
+        }
+
+        public int Step
+        {
+            get { return _step; }
+            set { if (value > 0) _step = value; }
+        }
+
+        // 数字后缀，如 "%"（纯装饰，不参与取值）
+        public string Suffix
+        {
+            get { return _suffix; }
+            set { _suffix = value ?? ""; Invalidate(); }
+        }
+
+        public bool IsEditing { get { return _editing; } }
+
+        public SpinnerInput()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
+                     ControlStyles.SupportsTransparentBackColor, true);
+            Size = new Size(Theme.S(64), Theme.S(24));
+            Font = Theme.FontSmallBold;
+            Cursor = Cursors.Hand;
+            BackColor = Color.Transparent;
+            TabStop = false;
+
+            _repeatTimer = new System.Windows.Forms.Timer();
+            _repeatTimer.Interval = 110;
+            _repeatTimer.Tick += delegate
+            {
+                if (_pressedUp) Bump(_step);
+                else if (_pressedDown) Bump(-_step);
+            };
+        }
+
+        private int Clamp(int v)
+        {
+            if (v < _min) v = _min;
+            if (v > _max) v = _max;
+            return v;
+        }
+
+        private Rectangle UpRect()
+        {
+            int aw = ArrowWidth();
+            return new Rectangle(Width - aw - Theme.S(4), Theme.S(3), aw, (Height - Theme.S(6)) / 2);
+        }
+
+        private Rectangle DownRect()
+        {
+            int aw = ArrowWidth();
+            int half = (Height - Theme.S(6)) / 2;
+            return new Rectangle(Width - aw - Theme.S(4), Theme.S(3) + half + 1, aw, half);
+        }
+
+        private int ArrowWidth()
+        {
+            return Math.Max(Theme.S(10), FontHeight / 2);
+        }
+
+        private Rectangle ValueRect()
+        {
+            int aw = ArrowWidth();
+            return new Rectangle(Theme.S(4), 1, Width - aw - Theme.S(10), Height - 2);
+        }
+
+        private void Bump(int delta)
+        {
+            if (_editing) return;
+            Value = _value + delta;
+            if (EditCommitted != null) EditCommitted(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            _hovered = true;
+            Invalidate();
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            _hovered = false;
+            _hoverUp = false;
+            _hoverDown = false;
+            _pressedUp = false;
+            _pressedDown = false;
+            _repeatTimer.Stop();
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            bool hu = UpRect().Contains(e.Location);
+            bool hd = DownRect().Contains(e.Location);
+            if (hu != _hoverUp || hd != _hoverDown)
+            {
+                _hoverUp = hu;
+                _hoverDown = hd;
+                Invalidate();
+            }
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (!Enabled) return;
+            Focus();
+
+            if (UpRect().Contains(e.Location))
+            {
+                _pressedUp = true;
+                Bump(_step);
+                _repeatTimer.Start();
+                Invalidate();
+            }
+            else if (DownRect().Contains(e.Location))
+            {
+                _pressedDown = true;
+                Bump(-_step);
+                _repeatTimer.Start();
+                Invalidate();
+            }
+            else if (ValueRect().Contains(e.Location))
+            {
+                BeginEdit();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            bool wasRepeat = _pressedUp || _pressedDown;
+            _pressedUp = false;
+            _pressedDown = false;
+            _repeatTimer.Stop();
+            if (wasRepeat) Invalidate();
+            base.OnMouseUp(e);
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            if (keyData == Keys.Up || keyData == Keys.Down) return true;
+            return base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (!Enabled) return;
+            if (e.KeyCode == Keys.Up)
+            {
+                Bump(_step);
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Down)
+            {
+                Bump(-_step);
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Enter)
+            {
+                BeginEdit();
+                e.Handled = true;
+            }
+        }
+
+        // 进入编辑态：创建临时输入框覆盖在数字区域上
+        private void BeginEdit()
+        {
+            if (_editing || !Enabled) return;
+            _editing = true;
+
+            Rectangle vr = ValueRect();
+            TextBox tb = new TextBox();
+            tb.BorderStyle = BorderStyle.None;
+            tb.BackColor = Theme.Surface;
+            tb.ForeColor = Theme.Text;
+            tb.Font = Theme.FontSmallBold;
+            tb.TextAlign = HorizontalAlignment.Center;
+            tb.MaxLength = 4;
+            tb.Text = _value.ToString();
+            tb.SetBounds(vr.X, vr.Y + (vr.Height - tb.PreferredHeight) / 2, vr.Width, tb.PreferredHeight);
+            Controls.Add(tb);
+            tb.BringToFront();
+            tb.Focus();
+            tb.SelectAll();
+
+            EventHandler commit = null;
+            EventHandler cancel = null;
+            commit = delegate
+            {
+                int v;
+                if (!int.TryParse(tb.Text.Trim().TrimEnd('%'), out v)) v = _value;
+                tb.Dispose();
+                _editing = false;
+                Controls.Remove(tb);
+                Value = v;
+                Invalidate();
+                if (EditCommitted != null) EditCommitted(this, EventArgs.Empty);
+            };
+            cancel = delegate
+            {
+                tb.Dispose();
+                _editing = false;
+                Controls.Remove(tb);
+                Invalidate();
+            };
+            tb.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; commit(null, EventArgs.Empty); }
+                else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; cancel(null, EventArgs.Empty); }
+            };
+            tb.LostFocus += (s, e) => commit(null, EventArgs.Empty);
+            // 防止在 TextBox 内按上下方向键时被控件的编辑框吃掉：编辑态下传给输入框本身
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
+            using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(7)))
+            using (SolidBrush br = new SolidBrush(Theme.InputBg))
+            using (Pen bd = new Pen(_hovered ? Theme.BorderHover : Theme.Border, 1f))
+            {
+                g.FillPath(br, p);
+                g.DrawPath(bd, p);
+            }
+
+            // 数字区
+            Rectangle vr = ValueRect();
+            Color numColor = Enabled ? Theme.Text : Theme.TextDim;
+            if (!_editing)
+            {
+                TextRenderer.DrawText(g, _value.ToString() + _suffix, Font, vr, numColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            }
+
+            // 上下箭头区
+            DrawArrow(g, UpRect(), _hoverUp, _pressedUp, true);
+            DrawArrow(g, DownRect(), _hoverDown, _pressedDown, false);
+        }
+
+        private void DrawArrow(Graphics g, Rectangle r, bool hovered, bool pressed, bool up)
+        {
+            Color c = pressed ? Theme.Accent : (hovered ? Theme.AccentHover : Theme.TextMuted);
+            int cx = r.X + r.Width / 2;
+            int cy = r.Y + r.Height / 2;
+            int half = Math.Max(2, Math.Min(r.Width, r.Height) / 2 - 1);
+
+            using (Pen pen = new Pen(c, Math.Max(1.4f, 1.4f * Theme.Scale)))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                if (up) g.DrawLine(pen, cx - half, cy + 1, cx, cy - 1);
+                else g.DrawLine(pen, cx - half, cy - 1, cx, cy + 1);
+                if (up) g.DrawLine(pen, cx, cy - 1, cx + half, cy + 1);
+                else g.DrawLine(pen, cx, cy + 1, cx + half, cy - 1);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_repeatTimer != null) { _repeatTimer.Stop(); _repeatTimer.Dispose(); _repeatTimer = null; }
+            }
+            base.Dispose(disposing);
+        }
+    }
+
     internal class LightColorTable : ProfessionalColorTable
     {
         public override Color MenuItemSelected { get { return Theme.InputBg; } }
@@ -1747,11 +2070,11 @@ namespace GameMuteHelper
 
         private ToggleSwitch _muteToggle;
         private ToggleSwitch _fpsToggle;
-        private TextBox _fpsInput;
+        private SpinnerInput _fpsSpinner;
+        private SpinnerInput _volumeSpinner;
         private PillButton _actionBtn;
         private PillButton _methodBtn;
         private PillButton _audioBtn;
-        private TextBox _volumeInput;
         private ContextMenuStrip _methodMenu;
         private ContextMenuStrip _audioMenu;
         private bool _rtssInstalled;
@@ -1829,69 +2152,41 @@ namespace GameMuteHelper
             if (tips != null) tips.SetToolTip(_audioBtn, "点击切换后台音频方式：完全静音或降低到指定百分比");
             Controls.Add(_audioBtn);
 
-            _volumeInput = new TextBox();
-            _volumeInput.BorderStyle = BorderStyle.None;
-            _volumeInput.BackColor = Theme.InputBg;
-            _volumeInput.Font = Theme.FontSmallBold;
-            _volumeInput.TextAlign = HorizontalAlignment.Center;
-            _volumeInput.MaxLength = 3;
-            _volumeInput.Text = _volumePercent.ToString();
-            bool volOn = _audioMode == AudioModes.Attenuate;
-            _volumeInput.Visible = volOn;
-            _volumeInput.KeyDown += (s, e) =>
-            {
-                if (e.KeyCode == Keys.Enter)
-                {
-                    e.SuppressKeyPress = true;
-                    CommitVolume();
-                    this.Focus();
-                }
-            };
-            _volumeInput.LostFocus += (s, e) => CommitVolume();
-            _volumeInput.GotFocus += (s, e) => _volumeInput.SelectAll();
-            Controls.Add(_volumeInput);
-            if (tips != null) tips.SetToolTip(_volumeInput, "后台音量百分比（5–90）");
+            _volumeSpinner = new SpinnerInput();
+            _volumeSpinner.Minimum = AudioModes.MinVolumePercent;
+            _volumeSpinner.Maximum = AudioModes.MaxVolumePercent;
+            _volumeSpinner.Step = 5;
+            _volumeSpinner.Suffix = "%";
+            _volumeSpinner.Value = _volumePercent;
+            _volumeSpinner.Visible = _audioMode == AudioModes.Attenuate;
+            _volumeSpinner.EditCommitted += (s, e) => CommitVolume();
+            Controls.Add(_volumeSpinner);
+            if (tips != null) tips.SetToolTip(_volumeSpinner, "后台音量百分比：点击数字直接输入，箭头 ±5");
 
             _fpsToggle = new ToggleSwitch();
             _fpsToggle.Enabled = MethodAvailable(_method);
             _fpsToggle.Checked = _fpsToggle.Enabled && rule.LimitFps;
             _fpsToggle.CheckedChanged += (s, e) =>
             {
-                if (_fpsInput != null)
+                if (_fpsSpinner != null)
                 {
-                    bool on = _fpsToggle.Checked;
-                    _fpsInput.ReadOnly = !on;
-                    _fpsInput.ForeColor = on ? Theme.Text : Theme.TextDim;
+                    _fpsSpinner.Enabled = _fpsToggle.Checked;
                 }
                 Invalidate();
                 NotifyRuleChanged();
             };
             Controls.Add(_fpsToggle);
 
-            _fpsInput = new TextBox();
-            _fpsInput.BorderStyle = BorderStyle.None;
-            _fpsInput.BackColor = Theme.InputBg;
-            _fpsInput.Font = Theme.FontSmallBold;
-            _fpsInput.TextAlign = HorizontalAlignment.Center;
-            _fpsInput.MaxLength = 4;
+            _fpsSpinner = new SpinnerInput();
             _value = LimitMethods.Clamp(_method, rule.Fps);
-            _fpsInput.Text = LimitMethods.DisplayValue(_method, _value);
-            bool valueOn = _fpsToggle.Checked;
-            _fpsInput.ReadOnly = !valueOn;
-            _fpsInput.ForeColor = valueOn ? Theme.Text : Theme.TextDim;
-            _fpsInput.KeyDown += (s, e) =>
-            {
-                if (e.KeyCode == Keys.Enter)
-                {
-                    e.SuppressKeyPress = true;
-                    CommitValue();
-                    this.Focus();
-                }
-            };
-            _fpsInput.LostFocus += (s, e) => CommitValue();
-            _fpsInput.GotFocus += (s, e) => _fpsInput.SelectAll();
-            Controls.Add(_fpsInput);
-            if (tips != null) tips.SetToolTip(_fpsInput, ValueTooltip(_method));
+            _fpsSpinner.Minimum = 1;
+            _fpsSpinner.Maximum = LimitMethods.Normalize(_method) == LimitMethods.Cpu ? 100 : 240;
+            _fpsSpinner.Step = 5;
+            _fpsSpinner.Suffix = LimitMethods.Normalize(_method) == LimitMethods.Cpu ? "%" : "";
+            _fpsSpinner.Value = _value;
+            _fpsSpinner.Enabled = _fpsToggle.Checked;
+            _fpsSpinner.EditCommitted += (s, e) => CommitValue();
+            if (tips != null) tips.SetToolTip(_fpsSpinner, ValueTooltip(_method) + "；点击数字直接输入，箭头 ±5");
 
             // 每个应用独立的限帧方式选择
             _methodBtn = new PillButton();
@@ -1945,10 +2240,10 @@ namespace GameMuteHelper
             _audioMode = m;
             bool atten = AudioModes.IsAttenuate(_audioMode);
             if (_audioBtn != null) _audioBtn.Text = AudioModes.ShortLabel(_audioMode);
-            if (_volumeInput != null)
+            if (_volumeSpinner != null)
             {
-                _volumeInput.Visible = atten;
-                if (atten) _volumeInput.Text = _volumePercent.ToString();
+                _volumeSpinner.Visible = atten;
+                if (atten) _volumeSpinner.Value = _volumePercent;
             }
             Invalidate();
             NotifyRuleChanged();
@@ -1956,18 +2251,15 @@ namespace GameMuteHelper
 
         private int ParseVolume()
         {
-            int val;
-            string text = _volumeInput == null ? "" : _volumeInput.Text.Trim().TrimEnd('%');
-            if (!int.TryParse(text, out val)) val = AudioModes.DefaultVolume;
+            int val = _volumeSpinner == null ? AudioModes.DefaultVolume : _volumeSpinner.Value;
             _volumePercent = AudioModes.ClampVolume(val);
             return _volumePercent;
         }
 
         private void CommitVolume()
         {
-            if (_volumeInput == null || !_volumeInput.Visible) return;
-            int val = ParseVolume();
-            if (_volumeInput.Text != val.ToString()) _volumeInput.Text = val.ToString();
+            if (_volumeSpinner == null || !_volumeSpinner.Visible) return;
+            ParseVolume();
             NotifyRuleChanged();
         }
 
@@ -2007,18 +2299,16 @@ namespace GameMuteHelper
 
         private int ParseValue()
         {
-            int val;
-            string text = _fpsInput == null ? "" : _fpsInput.Text.Trim().TrimEnd('%');
-            if (!int.TryParse(text, out val)) val = 5;
+            int val = _fpsSpinner == null ? 5 : _fpsSpinner.Value;
             _value = LimitMethods.Clamp(_method, val);
             return _value;
         }
 
         private void CommitValue()
         {
-            int val = ParseValue();
-            string display = LimitMethods.DisplayValue(_method, val);
-            if (_fpsInput != null && _fpsInput.Text != display) _fpsInput.Text = display;
+            if (_fpsSpinner == null) return;
+            ParseValue();
+            _fpsSpinner.Value = _value; // 同步回控件（含 clamp 后的显示）
             NotifyRuleChanged();
         }
 
@@ -2075,12 +2365,12 @@ namespace GameMuteHelper
                 _fpsToggle.Enabled = available;
                 if (!available) _fpsToggle.Checked = false;
             }
-            if (_fpsInput != null)
+            if (_fpsSpinner != null)
             {
-                _fpsInput.Text = LimitMethods.DisplayValue(_method, _value);
-                bool on = _fpsToggle != null && _fpsToggle.Checked;
-                _fpsInput.ReadOnly = !on;
-                _fpsInput.ForeColor = on ? Theme.Text : Theme.TextDim;
+                _fpsSpinner.Maximum = m == LimitMethods.Cpu ? 100 : 240;
+                _fpsSpinner.Suffix = m == LimitMethods.Cpu ? "%" : "";
+                _fpsSpinner.Value = _value;
+                _fpsSpinner.Enabled = _fpsToggle != null && _fpsToggle.Checked;
             }
             Invalidate();
             NotifyRuleChanged();
@@ -2111,34 +2401,10 @@ namespace GameMuteHelper
             LayoutChildControls();
         }
 
-        private Rectangle GetFpsBoxRect()
-        {
-            int boxH = Theme.S(28);
-            return new Rectangle(Width - Theme.S(108), (Height - boxH) / 2, Theme.S(56), boxH);
-        }
-
-        private Rectangle GetVolumeBoxRect()
-        {
-            int boxH = Theme.S(24);
-            return new Rectangle(Width - Theme.S(392), (Height - boxH) / 2, Theme.S(52), boxH);
-        }
-
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            // 点击圆角框的空白边距时，把焦点转给真正的输入框
-            if (IsManagedView && _fpsInput != null && !_fpsInput.ReadOnly
-                && GetFpsBoxRect().Contains(e.Location))
-            {
-                _fpsInput.Focus();
-                _fpsInput.SelectAll();
-            }
-            if (IsManagedView && _volumeInput != null && _volumeInput.Visible
-                && GetVolumeBoxRect().Contains(e.Location))
-            {
-                _volumeInput.Focus();
-                _volumeInput.SelectAll();
-            }
+            // SpinnerInput 自带点击处理（箭头 ±5 / 数字区直接输入），无需转发
         }
 
         private void LayoutChildControls()
@@ -2151,13 +2417,8 @@ namespace GameMuteHelper
             {
                 if (_actionBtn != null)
                     _actionBtn.Location = new Point(w - Theme.S(40), (h - _actionBtn.Height) / 2);
-                if (_fpsInput != null)
-                {
-                    // 单行 TextBox 的高度由字体决定，这里只把宽度撑满可见圆角框，
-                    // 并垂直居中；剩余边距由卡片转发点击处理。
-                    int inH = _fpsInput.Height;
-                    _fpsInput.SetBounds(w - Theme.S(105), (h - inH) / 2, Theme.S(50), inH);
-                }
+                if (_fpsSpinner != null)
+                    _fpsSpinner.Location = new Point(w - Theme.S(114), (h - _fpsSpinner.Height) / 2);
                 if (_fpsToggle != null)
                     _fpsToggle.Location = new Point(w - Theme.S(156), (h - _fpsToggle.Height) / 2);
                 if (_methodBtn != null)
@@ -2166,11 +2427,8 @@ namespace GameMuteHelper
                     _muteToggle.Location = new Point(w - Theme.S(256), (h - _muteToggle.Height) / 2);
                 if (_audioBtn != null)
                     _audioBtn.Location = new Point(w - Theme.S(330), (h - _audioBtn.Height) / 2);
-                if (_volumeInput != null)
-                {
-                    int vinH = _volumeInput.Height;
-                    _volumeInput.SetBounds(w - Theme.S(389), (h - vinH) / 2, Theme.S(46), vinH);
-                }
+                if (_volumeSpinner != null)
+                    _volumeSpinner.Location = new Point(w - Theme.S(400), (h - _volumeSpinner.Height) / 2);
             }
             else
             {
@@ -2212,8 +2470,8 @@ namespace GameMuteHelper
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
 
-            // 右侧控件（从右到左）：X(40) FPS框(108) FPS开关(156) 方式(216) 音频开关(256)
-            // 音频按钮(330) 音量框(392) 标签(440) 状态胶囊(536)
+            // 右侧控件（从右到左）：X(40) FPS框(114) FPS开关(156) 方式(216) 音频开关(256)
+            // 音频按钮(330) 音量框(400) 标签(448) 状态胶囊(536)
             int rightReserve = IsManagedView ? Theme.S(536) : Theme.S(204);
             int textX = Theme.S(60);
             int textWidth = Math.Max(Theme.S(100), Width - textX - rightReserve);
@@ -2246,34 +2504,9 @@ namespace GameMuteHelper
             {
                 int lblH = Theme.S(24);
                 int lblY = (Height - lblH) / 2;
-                Rectangle muteLblRect = new Rectangle(Width - Theme.S(440), lblY, Theme.S(46), lblH);
+                Rectangle muteLblRect = new Rectangle(Width - Theme.S(448), lblY, Theme.S(46), lblH);
                 TextRenderer.DrawText(g, "音频", Theme.FontSmall, muteLblRect, Theme.TextMuted,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-
-                Rectangle fpsBox = GetFpsBoxRect();
-                bool fpsActive = _fpsToggle != null && _fpsToggle.Checked;
-                using (GraphicsPath fp = Theme.RoundedRect(fpsBox, Theme.S(7)))
-                using (SolidBrush fbr = new SolidBrush(Theme.InputBg))
-                using (Pen fbd = new Pen(fpsActive ? Theme.BorderHover : Theme.Border, 1f))
-                {
-                    g.FillPath(fbr, fp);
-                    g.DrawPath(fbd, fp);
-                }
-
-                if (_volumeInput != null && _volumeInput.Visible)
-                {
-                    Rectangle volBox = GetVolumeBoxRect();
-                    using (GraphicsPath vp = Theme.RoundedRect(volBox, Theme.S(7)))
-                    using (SolidBrush vbr = new SolidBrush(Theme.InputBg))
-                    using (Pen vbd = new Pen(Theme.Border, 1f))
-                    {
-                        g.FillPath(vbr, vp);
-                        g.DrawPath(vbd, vp);
-                    }
-                    Rectangle pctRect = new Rectangle(volBox.X + volBox.Width - Theme.S(16), lblY, Theme.S(14), lblH);
-                    TextRenderer.DrawText(g, "%", Theme.FontSmall, pctRect, Theme.TextMuted,
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-                }
             }
         }
     }
