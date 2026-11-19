@@ -1944,8 +1944,11 @@ namespace GameMuteHelper
 
             EventHandler commit = null;
             EventHandler cancel = null;
+            bool done = false; // 一次性守卫：dispose 过程中 LostFocus 会再次触发
             commit = delegate
             {
+                if (done) return;
+                done = true;
                 int v;
                 if (!int.TryParse(tb.Text.Trim().TrimEnd('%'), out v)) v = _value;
                 tb.Dispose();
@@ -1957,6 +1960,8 @@ namespace GameMuteHelper
             };
             cancel = delegate
             {
+                if (done) return;
+                done = true;
                 tb.Dispose();
                 _editing = false;
                 Controls.Remove(tb);
@@ -1968,7 +1973,59 @@ namespace GameMuteHelper
                 else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; cancel(null, EventArgs.Empty); }
             };
             tb.LostFocus += (s, e) => commit(null, EventArgs.Empty);
-            // 防止在 TextBox 内按上下方向键时被控件的编辑框吃掉：编辑态下传给输入框本身
+
+            // 点击编辑框以外的任何地方（包括不可聚焦的卡片背景/标签/禁用控件）
+            // 都自动提交：LostFocus 只在焦点移到可聚焦控件时触发，
+            // 点卡片背景这类不可聚焦区域时不会触发，所以用消息过滤器补位
+            EditCommitFilter clickFilter = new EditCommitFilter(tb, delegate { commit(null, EventArgs.Empty); });
+            Application.AddMessageFilter(clickFilter);
+
+            // 切到其他应用或点窗口标题栏时也提交
+            Form hostForm = FindForm();
+            EventHandler onDeactivate = delegate { commit(null, EventArgs.Empty); };
+            if (hostForm != null) hostForm.Deactivate += onDeactivate;
+
+            tb.Disposed += (s, e) =>
+            {
+                Application.RemoveMessageFilter(clickFilter);
+                if (hostForm != null) hostForm.Deactivate -= onDeactivate;
+            };
+        }
+
+        // 编辑期间：任何落在编辑框之外的鼠标按下都触发提交（消息不拦截）
+        private class EditCommitFilter : IMessageFilter
+        {
+            private readonly Control _editor;
+            private readonly Action _commit;
+
+            public EditCommitFilter(Control editor, Action commit)
+            {
+                _editor = editor;
+                _commit = commit;
+            }
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                const int WM_LBUTTONDOWN = 0x0201;
+                const int WM_NCLBUTTONDOWN = 0x00A1;
+                if (m.Msg != WM_LBUTTONDOWN && m.Msg != WM_NCLBUTTONDOWN) return false;
+                if (_editor.IsDisposed || !_editor.Focused) return false;
+
+                // 点在编辑框内部：交给 TextBox 正常处理
+                if (m.Msg == WM_LBUTTONDOWN)
+                {
+                    Control target = Control.FromHandle(m.HWnd);
+                    if (target != null && (target == _editor || _editor.Contains(target)))
+                    {
+                        Point pt = target.PointToClient(Cursor.Position);
+                        if (target.ClientRectangle.Contains(pt)) return false;
+                    }
+                }
+
+                // 其他任何地方：提交数值，不拦截消息
+                try { _commit(); } catch { }
+                return false;
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
