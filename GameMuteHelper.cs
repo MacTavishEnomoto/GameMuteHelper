@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.4.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.4.0.0")]
+[assembly: System.Reflection.AssemblyVersion("3.4.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.4.1.0")]
 
 namespace GameMuteHelper
 {
@@ -86,7 +86,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.0 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.1 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -2283,16 +2283,32 @@ namespace GameMuteHelper
     // =========================================================================
     internal class MainForm : Form
     {
+        private enum FadeKind { None, Down, Up }
+
+        // 渐变到原值后要做什么：移除记录（回前台）/ 设静音（切回静音方式）/ 无
+        private enum AfterUpKind { None, RemoveRecord, SetMute }
+
+        // 降音量/恢复的线性渐变：全程 FadeMs 毫秒，每 FadeStepMs 步进一次
+        private const int FadeMs = 1000;
+        private const int FadeStepMs = 50;
+
         // 我们改过的音频会话：记录原始状态；恢复失败时保留记录下个 tick 重试
         private class AudioTrack
         {
-            public uint Pid;             // 会话所属进程，用于孤儿记录清理
-            public bool WasMuted;        // 会话原始静音状态
+            public uint Pid;              // 会话所属进程，用于孤儿记录清理
+            public string AppName;        // 所属应用名（渐变完成提示用）
+            public bool WasMuted;         // 会话原始静音状态
             public float WasVolume;       // 会话原始音量
-            public bool WeMuted;         // 我们设置的静音（需要解除）
-            public bool Attenuated;      // 我们降低过音量（需要写回原值）
-            public int AppliedPct;       // 当前应用的后台音量百分比
-            public DateTime LastSeenUtc; // 会话最后一次出现在枚举中
+            public bool WeMuted;          // 我们设置的静音（需要解除）
+            public bool Attenuated;       // 我们正在/曾干预会话音量（需要写回原值）
+            public int AppliedPct;        // 当前应用的后台音量百分比
+            public float CurrentLevel;    // 渐变过程中最近一次写入的音量；-1 = 尚未干预
+            public FadeKind Fade;         // 当前渐变方向（None = 无进行中的渐变）
+            public float FadeFrom;        // 渐变起始音量
+            public float FadeTo;          // 渐变目标音量
+            public DateTime FadeStartUtc; // 渐变开始时间
+            public AfterUpKind AfterUp;   // 渐变到原值后的动作
+            public DateTime LastSeenUtc;  // 会话最后一次出现在枚举中
         }
 
         private readonly EventWaitHandle _showEvent;
@@ -2342,6 +2358,7 @@ namespace GameMuteHelper
         private Icon _iconMuted;
         private Icon _iconPaused;
         private System.Windows.Forms.Timer _monitorTimer;
+        private System.Windows.Forms.Timer _fadeTimer;
 
         public MainForm(EventWaitHandle showEvent, bool startBackground, bool isAdmin)
         {
@@ -2377,6 +2394,12 @@ namespace GameMuteHelper
             _monitorTimer.Interval = 500;
             _monitorTimer.Tick += OnMonitorTick;
             _monitorTimer.Start();
+
+            // 渐变步进定时器：常开低频无负担（tick 内无渐变时直接返回）
+            _fadeTimer = new System.Windows.Forms.Timer();
+            _fadeTimer.Interval = FadeStepMs;
+            _fadeTimer.Tick += delegate { try { FadeTick(); } catch (Exception ex) { AppLogger.Log("Fade tick error: " + ex.Message, "ERROR"); } };
+            _fadeTimer.Start();
 
             if (startBackground)
             {
@@ -2912,7 +2935,7 @@ namespace GameMuteHelper
             r.AudioVolume = AudioModes.ClampVolume(volumePercent);
 
             // 音频设置变化：立即恢复该应用所有会话的当前干预，让下个 tick 按新模式应用
-            RestoreRuleAudio(procName);
+            RestoreRuleAudio(procName, true);
             SaveState();
             string modeText = AudioModes.IsAttenuate(r.AudioMode)
                 ? string.Format("后台降至 {0}%", r.AudioVolume)
@@ -2920,8 +2943,9 @@ namespace GameMuteHelper
             SetFooterMessage(string.Format("已更新 {0}：{1}", procName, audioOn ? modeText : "音频干预关闭"));
         }
 
-        // 恢复某个应用名下所有进程的音频干预记录（按 PID 找会话再恢复）
-        private void RestoreRuleAudio(string procName)
+        // 恢复某个应用名下所有进程的音频干预记录（按 PID 找会话再恢复）。
+        // immediate=true：瞬间恢复（改设置时用，让新设置立即生效）
+        private void RestoreRuleAudio(string procName, bool immediate)
         {
             try
             {
@@ -2936,8 +2960,34 @@ namespace GameMuteHelper
                 for (int i = 0; i < sessions.Count; i++)
                 {
                     AudioSessionInfo s = sessions[i];
-                    if (s.Pid > 0 && pids.Contains((int)s.Pid))
+                    if (s.Pid <= 0 || !pids.Contains((int)s.Pid)) continue;
+                    if (immediate)
+                    {
+                        // 瞬间恢复：结束渐变并直接写回原值
+                        AudioTrack t;
+                        if (!_audioByUs.TryGetValue(s.InstanceId, out t)) continue;
+                        t.Fade = FadeKind.None;
+                        bool ok = true;
+                        if (t.Attenuated)
+                        {
+                            if (MuteCore.SetVolume(s.InstanceId, t.WasVolume))
+                            {
+                                t.Attenuated = false;
+                                t.CurrentLevel = t.WasVolume;
+                            }
+                            else ok = false;
+                        }
+                        if (t.WeMuted)
+                        {
+                            if (MuteCore.SetMute(s.InstanceId, t.WasMuted)) t.WeMuted = false;
+                            else ok = false;
+                        }
+                        if (ok) _audioByUs.Remove(s.InstanceId);
+                    }
+                    else
+                    {
                         RestoreSessionAudio(s.InstanceId, procName, "新设置");
+                    }
                 }
             }
             catch { }
@@ -2947,7 +2997,7 @@ namespace GameMuteHelper
         {
             if (!_rules.ContainsKey(procName)) return;
             _rules.Remove(procName);
-            RestoreRuleAudio(procName);
+            RestoreRuleAudio(procName, true);
             RestoreRuleLimits(procName);
             _inactiveSince.Remove(procName);
             _liveState.Remove(procName);
@@ -3157,33 +3207,82 @@ namespace GameMuteHelper
                             {
                                 track = new AudioTrack();
                                 track.Pid = s.Pid;
+                                track.AppName = name;
                                 track.WasMuted = s.Muted;
                                 track.WasVolume = s.Volume;
+                                track.CurrentLevel = -1f;
                                 _audioByUs[s.InstanceId] = track;
                             }
+                            track.AppName = name;
                             track.LastSeenUtc = now;
 
                             if (attenuate)
                             {
-                                // 从「静音」切到「降音量」：先解除我们自己设的静音
-                                if (track.WeMuted && MuteCore.SetMute(s.InstanceId, false)) track.WeMuted = false;
+                                // 从「静音」切到「降音量」：先解除我们自己设的静音（音量未动过，取会话当前值）
+                                if (track.WeMuted && MuteCore.SetMute(s.InstanceId, false))
+                                {
+                                    track.WeMuted = false;
+                                    track.CurrentLevel = s.Volume;
+                                }
                                 if (!track.WasMuted)
                                 {
+                                    float target = wantPct / 100f;
                                     if (!track.Attenuated)
                                     {
-                                        if (MuteCore.SetVolume(s.InstanceId, wantPct / 100f))
+                                        // 首次降音量：从会话当前音量线性渐变到目标（约 1 秒）
+                                        float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
+                                        track.Attenuated = true;
+                                        track.AppliedPct = wantPct;
+                                        if (Math.Abs(from - target) < 0.005f)
                                         {
-                                            track.Attenuated = true;
-                                            track.AppliedPct = wantPct;
-                                            SetFooterMessage(string.Format("{0} 切至后台 · 音量降至 {1}%", name, wantPct));
+                                            track.CurrentLevel = target;
+                                        }
+                                        else
+                                        {
+                                            track.Fade = FadeKind.Down;
+                                            track.FadeFrom = from;
+                                            track.FadeTo = target;
+                                            track.FadeStartUtc = now;
+                                            track.AfterUp = AfterUpKind.None;
+                                            SetFooterMessage(string.Format("{0} 切至后台 · 音量渐降至 {1}%", name, wantPct));
+                                        }
+                                    }
+                                    else if (track.Fade == FadeKind.Up)
+                                    {
+                                        // 回前台渐变中途又切回后台：从当前值折返向下
+                                        track.AppliedPct = wantPct;
+                                        float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
+                                        if (Math.Abs(from - target) >= 0.005f)
+                                        {
+                                            track.Fade = FadeKind.Down;
+                                            track.FadeFrom = from;
+                                            track.FadeTo = target;
+                                            track.FadeStartUtc = now;
+                                            track.AfterUp = AfterUpKind.None;
+                                            SetFooterMessage(string.Format("{0} 切至后台 · 音量渐降至 {1}%", name, wantPct));
+                                        }
+                                        else
+                                        {
+                                            track.Fade = FadeKind.None;
+                                            track.CurrentLevel = target;
                                         }
                                     }
                                     else if (track.AppliedPct != wantPct)
                                     {
-                                        if (MuteCore.SetVolume(s.InstanceId, wantPct / 100f))
+                                        // 后台期间调整目标百分比：从当前值渐变到新目标
+                                        track.AppliedPct = wantPct;
+                                        float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
+                                        if (track.Fade == FadeKind.Down)
                                         {
-                                            track.AppliedPct = wantPct;
-                                            SetFooterMessage(string.Format("{0} 后台音量已调整为 {1}%", name, wantPct));
+                                            track.FadeTo = target; // 已在渐降中，只改终点
+                                        }
+                                        else if (Math.Abs(from - target) >= 0.005f)
+                                        {
+                                            track.Fade = FadeKind.Down;
+                                            track.FadeFrom = from;
+                                            track.FadeTo = target;
+                                            track.FadeStartUtc = now;
+                                            SetFooterMessage(string.Format("{0} 后台音量渐调至 {1}%", name, wantPct));
                                         }
                                     }
                                     attNowPct = track.AppliedPct > 0 ? track.AppliedPct : wantPct;
@@ -3192,9 +3291,35 @@ namespace GameMuteHelper
                             }
                             else
                             {
-                                // 从「降音量」切到「静音」：先恢复我们改过的音量
-                                if (track.Attenuated && MuteCore.SetVolume(s.InstanceId, track.WasVolume)) track.Attenuated = false;
-                                if (!track.WasMuted && !track.WeMuted && !s.Muted)
+                                // 静音方式（含从「降音量」切过来）：先把音量渐回原值，完成后设我们的静音
+                                if (track.Attenuated)
+                                {
+                                    if (track.Fade == FadeKind.Up)
+                                    {
+                                        track.AfterUp = AfterUpKind.SetMute; // 已在渐回，只更新完成动作
+                                    }
+                                    else
+                                    {
+                                        float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
+                                        if (Math.Abs(from - track.WasVolume) < 0.005f)
+                                        {
+                                            if (MuteCore.SetVolume(s.InstanceId, track.WasVolume))
+                                            {
+                                                track.CurrentLevel = track.WasVolume;
+                                                track.Attenuated = false;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            track.Fade = FadeKind.Up;
+                                            track.FadeFrom = from;
+                                            track.FadeTo = track.WasVolume;
+                                            track.FadeStartUtc = now;
+                                            track.AfterUp = AfterUpKind.SetMute;
+                                        }
+                                    }
+                                }
+                                if (!track.WasMuted && !track.WeMuted && !s.Muted && !track.Attenuated)
                                 {
                                     if (MuteCore.SetMute(s.InstanceId, true))
                                     {
@@ -3383,7 +3508,8 @@ namespace GameMuteHelper
             {
                 string id = expired[i];
                 AudioTrack t = _audioByUs[id];
-                if (t.Attenuated) { if (MuteCore.SetVolume(id, t.WasVolume)) t.Attenuated = false; }
+                t.Fade = FadeKind.None; // 结束可能进行中的渐变
+                if (t.Attenuated) { if (MuteCore.SetVolume(id, t.WasVolume)) { t.Attenuated = false; t.CurrentLevel = t.WasVolume; } }
                 if (t.WeMuted) { if (MuteCore.SetMute(id, t.WasMuted)) t.WeMuted = false; }
                 _audioByUs.Remove(id);
             }
@@ -3398,18 +3524,133 @@ namespace GameMuteHelper
             }
         }
 
-        // 恢复单个会话的音频到原始状态；失败时保留记录，下个 tick 自动重试
+        // 渐变步进：每 FadeStepMs 把进行中的渐变推进一步（线性插值，全程 FadeMs）
+        private void FadeTick()
+        {
+            if (_audioByUs.Count == 0) return;
+
+            DateTime now = DateTime.UtcNow;
+            List<KeyValuePair<string, AudioTrack>> fading = null;
+            foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
+            {
+                if (kv.Value.Fade != FadeKind.None) { if (fading == null) fading = new List<KeyValuePair<string, AudioTrack>>(); fading.Add(kv); }
+            }
+            if (fading == null) return;
+
+            for (int i = 0; i < fading.Count; i++)
+            {
+                string id = fading[i].Key;
+                AudioTrack t = fading[i].Value;
+
+                double progress = (now - t.FadeStartUtc).TotalMilliseconds / FadeMs;
+                if (progress > 1.0) progress = 1.0;
+                float level = t.FadeFrom + (t.FadeTo - t.FadeFrom) * (float)progress;
+                if (progress >= 1.0) level = t.FadeTo;
+
+                if (MuteCore.SetVolume(id, level))
+                {
+                    t.CurrentLevel = level;
+                }
+                else
+                {
+                    // 写入失败（会话短暂消失/COM 忙）：从当前实际位置重新起算
+                    t.FadeFrom = level;
+                    t.FadeStartUtc = now;
+                    continue;
+                }
+
+                if (progress >= 1.0)
+                {
+                    t.Fade = FadeKind.None;
+                    t.FadeFrom = t.FadeTo;
+                    FinishFade(id, t);
+                }
+            }
+        }
+
+        // 渐变完成后的收尾：按方向处理恢复/应用静音/移除记录
+        private void FinishFade(string id, AudioTrack t)
+        {
+            if (t.FadeTo >= 0f && Math.Abs(t.FadeTo - t.WasVolume) < 0.005f)
+            {
+                // 向上渐变完成：音量已回到原值
+                t.Attenuated = false;
+                t.CurrentLevel = t.WasVolume;
+
+                if (t.AfterUp == AfterUpKind.RemoveRecord)
+                {
+                    // 前台恢复路径：解除可能存在的静音后移除记录
+                    bool ok = true;
+                    if (t.WeMuted && !MuteCore.SetMute(id, t.WasMuted)) ok = false;
+                    if (ok)
+                    {
+                        t.WeMuted = false;
+                        _audioByUs.Remove(id);
+                        SetFooterMessage((string.IsNullOrEmpty(t.AppName) ? "应用" : t.AppName) + " · 音量已恢复");
+                    }
+                }
+                else if (t.AfterUp == AfterUpKind.SetMute && !t.WasMuted)
+                {
+                    // 静音方式路径：恢复原值后立即设我们自己的静音
+                    if (MuteCore.SetMute(id, true))
+                    {
+                        t.WeMuted = true;
+                        t.AfterUp = AfterUpKind.None;
+                        SetFooterMessage((string.IsNullOrEmpty(t.AppName) ? "应用" : t.AppName) + " 切至后台 · 已静音");
+                    }
+                }
+                else if (t.AfterUp == AfterUpKind.SetMute && t.WasMuted)
+                {
+                    t.AfterUp = AfterUpKind.None;
+                }
+            }
+            // 向下渐变完成：音量已在目标值，保持 Attenuated=true 等待恢复时机，无需处理
+        }
+
+        // 恢复单个会话的音频到原始状态（默认：渐变完成后移除记录）
         private bool RestoreSessionAudio(string instanceId, string name, string reason)
+        {
+            return RestoreSessionAudio(instanceId, name, reason, AfterUpKind.RemoveRecord);
+        }
+
+        private bool RestoreSessionAudio(string instanceId, string name, string reason, AfterUpKind afterUp)
         {
             AudioTrack track;
             if (!_audioByUs.TryGetValue(instanceId, out track)) return false;
 
-            bool ok = true;
+            // 有音量干预：启动向上渐变（从当前值到原值，约 1 秒），完成后再执行后续动作
             if (track.Attenuated)
             {
-                if (MuteCore.SetVolume(instanceId, track.WasVolume)) track.Attenuated = false;
-                else ok = false;
+                if (track.Fade == FadeKind.Up)
+                {
+                    // 已在向上渐变（可能由静音方式切换发起）：只更新完成动作，不重启计时
+                    track.AfterUp = afterUp;
+                    return false;
+                }
+                float from = track.CurrentLevel >= 0f ? track.CurrentLevel : track.WasVolume;
+                if (Math.Abs(from - track.WasVolume) < 0.005f)
+                {
+                    // 已经等于原值，直接完成
+                    if (MuteCore.SetVolume(instanceId, track.WasVolume))
+                    {
+                        track.CurrentLevel = track.WasVolume;
+                        track.Attenuated = false;
+                    }
+                }
+                else
+                {
+                    track.Fade = FadeKind.Up;
+                    track.FadeFrom = from;
+                    track.FadeTo = track.WasVolume;
+                    track.FadeStartUtc = DateTime.UtcNow;
+                    track.AfterUp = afterUp;
+                    SetFooterMessage(name + " 切回" + reason + " · 音量渐变恢复中");
+                    return false; // 渐变完成后由 FinishFade 处理后续
+                }
             }
+
+            // 静音干预或无干预：立即解除（静音切换本身没有渐变，保持瞬时）
+            bool ok = true;
             if (track.WeMuted)
             {
                 if (MuteCore.SetMute(instanceId, track.WasMuted)) track.WeMuted = false;
@@ -3418,29 +3659,48 @@ namespace GameMuteHelper
 
             if (ok)
             {
+                if (afterUp == AfterUpKind.SetMute && !track.WasMuted)
+                {
+                    // 切回静音方式：恢复原值后立即设我们自己的静音
+                    if (MuteCore.SetMute(instanceId, true))
+                    {
+                        track.WeMuted = true;
+                        SetFooterMessage(track.AppName + " 切至后台 · 已静音");
+                        return true;
+                    }
+                    return false;
+                }
                 _audioByUs.Remove(instanceId);
                 SetFooterMessage(name + " 切回" + reason + " · 已恢复音量");
                 return true;
             }
-            // 恢复失败（COM 忙、设备切换等）：保留记录，500ms 后重试
+            // 恢复失败（COM 忙、设备切换等）：保留记录，下个 tick 重试
             AppLogger.Log(string.Format("Audio restore retry: {0}", instanceId), "WARN");
             return false;
         }
 
-        // 恢复全部会话（暂停/移除/退出/注销时）。restoreFailedToo=true 时强制再试一轮。
+        // 恢复全部会话（暂停/移除/退出/注销时）：立即恢复，不走渐变。
+        // restoreFailedToo=true 时（退出/注销）即使失败也清空记录。
         private void RestoreAudio(bool restoreFailedToo)
         {
             List<string> done = new List<string>();
             foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
             {
-                if (!kv.Value.Attenuated && !kv.Value.WeMuted)
+                AudioTrack t = kv.Value;
+                if (!t.Attenuated && !t.WeMuted && t.Fade == FadeKind.None)
                 {
                     done.Add(kv.Key); // 只是记录了原始状态还没改过，直接丢
                     continue;
                 }
-                if (MuteCore.SetVolume(kv.Key, kv.Value.WasVolume)) kv.Value.Attenuated = false;
-                if (MuteCore.SetMute(kv.Key, kv.Value.WasMuted)) kv.Value.WeMuted = false;
-                if (!kv.Value.Attenuated && !kv.Value.WeMuted) done.Add(kv.Key);
+                // 立即结束任何进行中的渐变
+                t.Fade = FadeKind.None;
+                if (t.Attenuated && MuteCore.SetVolume(kv.Key, t.WasVolume))
+                {
+                    t.Attenuated = false;
+                    t.CurrentLevel = t.WasVolume;
+                }
+                if (t.WeMuted && MuteCore.SetMute(kv.Key, t.WasMuted)) t.WeMuted = false;
+                if (!t.Attenuated && !t.WeMuted) done.Add(kv.Key);
             }
             for (int i = 0; i < done.Count; i++) _audioByUs.Remove(done[i]);
             if (restoreFailedToo)
