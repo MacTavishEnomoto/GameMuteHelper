@@ -75,13 +75,15 @@ namespace GameMuteHelper
                 Application.SetCompatibleTextRenderingDefault(false);
 
                 // 兜底：任何未处理异常都先恢复被挂起/限流的进程，避免目标永久挂起
-                AppDomain.CurrentDomain.UnhandledException += delegate
+                AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs ue)
                 {
+                    try { AppLogger.Log("Fatal: " + (ue != null && ue.ExceptionObject != null ? ue.ExceptionObject.ToString() : "?"), "ERROR"); } catch { }
                     try { SuspendCore.StopAll(); } catch { }
                     try { CpuQuotaCore.RestoreAll(); } catch { }
                 };
-                Application.ThreadException += delegate
+                Application.ThreadException += delegate(object s, ThreadExceptionEventArgs te)
                 {
+                    try { AppLogger.Log("UI error: " + (te != null && te.Exception != null ? te.Exception.ToString() : "?"), "ERROR"); } catch { }
                     try { SuspendCore.StopAll(); } catch { }
                 };
 
@@ -2443,6 +2445,15 @@ namespace GameMuteHelper
             base.Dispose(disposing);
         }
 
+        // 原地更新窗口标题（软刷新用，不销毁卡片、不丢编辑/滚动状态）
+        public void UpdateTitle(string title)
+        {
+            string t = title ?? "";
+            if (_windowTitle == t) return;
+            _windowTitle = t;
+            Invalidate();
+        }
+
         public void SetStatus(string text, Color fg, Color bg)
         {
             if (_statusText == text && _statusFg == fg) return;
@@ -2614,6 +2625,7 @@ namespace GameMuteHelper
         private Dictionary<string, DateTime> _inactiveSince;
         private Dictionary<string, string> _liveState;
         private Dictionary<string, Image> _iconCache;
+        private readonly object _iconCacheSync = new object();
         private Dictionary<string, string> _runningTitles;
         private List<AppCardControl> _visibleCards;
 
@@ -2623,6 +2635,7 @@ namespace GameMuteHelper
         private string _lastTrayKey = "";
         private int _rtssUiTick;
         private bool _rtssStartInFlight;
+        private bool _scanInFlight;
         private DateTime _lastRtssAutoRestart = DateTime.MinValue;
 
         private ToolTip _tips;
@@ -2676,7 +2689,7 @@ namespace GameMuteHelper
 
             SystemEvents.SessionEnding += OnSessionEnding;
             RecoverFromCrash();
-            ScanRunningProcesses();
+            ScanRunningProcesses(); // 后台扫描；首次结果通过 BeginInvoke 回填并按需刷新
             RebuildCardList();
             UpdateHeaderAndTray();
 
@@ -2843,9 +2856,10 @@ namespace GameMuteHelper
             _refreshBtn.Visible = false;
             _refreshBtn.Click += (s, e) =>
             {
+                // 扫描已转为后台执行；完成后在 UI 线程自动合并并刷新列表
                 ScanRunningProcesses();
                 RebuildCardList();
-                SetFooterMessage("已刷新运行中的程序列表");
+                SetFooterMessage("正在后台刷新运行中的程序列表...");
             };
             toolbar.Controls.Add(_refreshBtn);
 
@@ -3019,8 +3033,62 @@ namespace GameMuteHelper
             _tray.ContextMenuStrip = menu;
         }
 
+        // 刷新入口：后台线程扫描（图标提取是磁盘 IO，同步做会冻结 UI），
+        // 完成后回 UI 线程合并结果并刷新卡片。扫描中重复调用自动合并为一次。
         private void ScanRunningProcesses()
         {
+            if (_scanInFlight) return;
+            _scanInFlight = true;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Dictionary<string, string> found = null;
+                Dictionary<string, Image> newIcons = null;
+                try
+                {
+                    ScanRunningProcessesWorker(out found, out newIcons);
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log("Scan running processes failed: " + ex.Message, "ERROR");
+                }
+
+                try
+                {
+                    if (IsDisposed || !IsHandleCreated)
+                    {
+                        _scanInFlight = false;
+                        return;
+                    }
+                    BeginInvoke((Action)delegate
+                    {
+                        _scanInFlight = false;
+                        if (found != null)
+                        {
+                            _runningTitles = found;
+                            lock (_iconCacheSync)
+                            {
+                                foreach (KeyValuePair<string, Image> kv in newIcons)
+                                {
+                                    if (!_iconCache.ContainsKey(kv.Key)) _iconCache[kv.Key] = kv.Value;
+                                    else kv.Value.Dispose(); // 已有缓存（并发扫描竞态），丢弃重复
+                                }
+                            }
+                            if (_tabs != null && _tabs.SelectedIndex == 1) RebuildCardList();
+                        }
+                    });
+                }
+                catch
+                {
+                    _scanInFlight = false;
+                }
+            });
+        }
+
+        // 实际扫描逻辑（后台线程执行）
+        private void ScanRunningProcessesWorker(out Dictionary<string, string> foundOut, out Dictionary<string, Image> newIconsOut)
+        {
+            Dictionary<string, Image> newIcons = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
             HashSet<int> audioPids = new HashSet<int>();
             List<AudioSessionInfo> sessions = MuteCore.GetSessions();
             for (int i = 0; i < sessions.Count; i++)
@@ -3045,27 +3113,32 @@ namespace GameMuteHelper
                         if (!found.ContainsKey(pn) || (string.IsNullOrEmpty(found[pn]) && !string.IsNullOrEmpty(title)))
                             found[pn] = title ?? "";
 
-                        if (!_iconCache.ContainsKey(pn))
+                        if (!found.ContainsKey(pn)) continue;
+                        lock (_iconCacheSync)
                         {
-                            try
+                            if (!_iconCache.ContainsKey(pn) && !newIcons.ContainsKey(pn))
                             {
-                                string exePath = p.MainModule.FileName;
-                                if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
+                                try
                                 {
-                                    using (Icon ico = Icon.ExtractAssociatedIcon(exePath))
+                                    string exePath = p.MainModule.FileName;
+                                    if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
                                     {
-                                        if (ico != null) _iconCache[pn] = ico.ToBitmap();
+                                        using (Icon ico = Icon.ExtractAssociatedIcon(exePath))
+                                        {
+                                            if (ico != null) newIcons[pn] = ico.ToBitmap();
+                                        }
                                     }
                                 }
+                                catch { }
                             }
-                            catch { }
                         }
                     }
                 }
                 catch { }
                 finally { p.Dispose(); }
             }
-            _runningTitles = found;
+            foundOut = found;
+            newIconsOut = newIcons;
         }
 
         private void RebuildCardList()
@@ -3073,6 +3146,10 @@ namespace GameMuteHelper
             _tabs.SetLabels(string.Format("已接管 ({0})", _rules.Count), "运行中");
             string q = _searchInput.Query.ToLowerInvariant();
             bool managedTab = (_tabs.SelectedIndex == 0);
+
+            // 软刷新：运行中标签页、无搜索词、卡片集合无增删时，
+            // 只原地更新标题与状态，不销毁卡片（保滚动位置与编辑状态）
+            if (!managedTab && string.IsNullOrEmpty(q) && TrySoftRefreshRunningCards()) return;
 
             _cardsHost.SuspendLayout();
             _cardsHost.AutoScrollPosition = new Point(0, 0);
@@ -3111,7 +3188,8 @@ namespace GameMuteHelper
                     if (!match) continue;
                 }
 
-                Image icon = _iconCache.ContainsKey(name) ? _iconCache[name] : null;
+                Image icon = null;
+                lock (_iconCacheSync) { if (_iconCache.ContainsKey(name)) icon = _iconCache[name]; }
                 AppRule rule = _rules.ContainsKey(name) ? _rules[name] : null;
                 AppCardControl card = new AppCardControl(name, title, icon, managedTab, rule, rule != null,
                     RtssBridge.IsInstalled, _tips, rule != null ? rule.Method : LimitMethods.Rtss);
@@ -3149,6 +3227,33 @@ namespace GameMuteHelper
 
             _cardsHost.ResumeLayout();
             ResizeCards();
+        }
+
+        // 运行中标签页软刷新：卡片集合未变时返回 true（调用方无需重建）
+        private bool TrySoftRefreshRunningCards()
+        {
+            if (_visibleCards.Count == 0) return false;
+
+            // 集合一致性检查：现卡片与最新扫描的进程名集合必须完全一致（顺序无关）
+            if (_visibleCards.Count != _runningTitles.Count) return false;
+            HashSet<string> current = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < _visibleCards.Count; i++) current.Add(_visibleCards[i].ProcessName);
+            if (current.Count != _runningTitles.Count) return false;
+            foreach (string k in _runningTitles.Keys)
+            {
+                if (!current.Contains(k)) return false;
+            }
+
+            // 原地更新：标题 + 状态徽章
+            for (int i = 0; i < _visibleCards.Count; i++)
+            {
+                AppCardControl card = _visibleCards[i];
+                string title;
+                _runningTitles.TryGetValue(card.ProcessName, out title);
+                card.UpdateTitle(title ?? "");
+                ApplyCardStatus(card);
+            }
+            return true;
         }
 
         private void ResizeCards()
@@ -3329,16 +3434,19 @@ namespace GameMuteHelper
                         _rules[pn] = new AppRule { Name = pn, Mute = true, LimitFps = false, Fps = 5 };
                         added++;
                     }
-                    if (!_iconCache.ContainsKey(pn))
+                    lock (_iconCacheSync)
                     {
-                        try
+                        if (!_iconCache.ContainsKey(pn))
                         {
-                            using (Icon ico = Icon.ExtractAssociatedIcon(fp))
+                            try
                             {
-                                if (ico != null) _iconCache[pn] = ico.ToBitmap();
+                                using (Icon ico = Icon.ExtractAssociatedIcon(fp))
+                                {
+                                    if (ico != null) _iconCache[pn] = ico.ToBitmap();
+                                }
                             }
+                            catch { }
                         }
-                        catch { }
                     }
                 }
                 if (added > 0)
