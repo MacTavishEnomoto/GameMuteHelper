@@ -2620,8 +2620,20 @@ namespace GameMuteHelper
             public float FadeFrom;        // 渐变起始音量
             public float FadeTo;          // 渐变目标音量
             public DateTime FadeStartUtc; // 渐变开始时间
-            public AfterUpKind AfterUp;   // 渐变到原值后的动作
+            public AfterUpKind AfterUp;    // 渐变到原值后的动作
             public DateTime LastSeenUtc;  // 会话最后一次出现在枚举中
+        }
+
+        // 同一 PID 的旧会话记录（会话被游戏重建时，新会话要继承原值，
+        // 否则新记录会把「我们降过的音量」错记为原始音量，回前台就恢复不到 100%）
+        private AudioTrack FindTrackByPid(uint pid)
+        {
+            if (pid == 0) return null;
+            foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
+            {
+                if (kv.Value.Pid == pid) return kv.Value;
+            }
+            return null;
         }
 
         private readonly EventWaitHandle _showEvent;
@@ -3660,6 +3672,26 @@ namespace GameMuteHelper
                                 track.WasMuted = s.Muted;
                                 track.WasVolume = s.Volume;
                                 track.CurrentLevel = -1f;
+
+                                // 会话被游戏重建（快速切窗常见）：同 PID 的旧记录还挂着，
+                                // 继承它的原值——否则会把我们降过的音量错记为「原始音量」，
+                                // 回前台就永远恢复不到真正的原值
+                                AudioTrack legacy = FindTrackByPid(s.Pid);
+                                if (legacy != null)
+                                {
+                                    track.WasMuted = legacy.WasMuted;
+                                    track.WasVolume = legacy.WasVolume;
+                                    if (legacy.Attenuated || legacy.WeMuted)
+                                    {
+                                        track.Attenuated = legacy.Attenuated;
+                                        track.WeMuted = legacy.WeMuted;
+                                        track.AppliedPct = legacy.AppliedPct;
+                                        track.CurrentLevel = legacy.CurrentLevel;
+                                        AppLogger.Log(string.Format(
+                                            "Session rebuilt: pid={0} inheriting WasVolume={1:0.00}",
+                                            s.Pid, legacy.WasVolume), "INFO");
+                                    }
+                                }
                                 _audioByUs[s.InstanceId] = track;
                             }
                             track.AppName = name;
