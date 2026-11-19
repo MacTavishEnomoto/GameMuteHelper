@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("3.2.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.2.1.0")]
 
 namespace GameMuteHelper
 {
@@ -75,7 +75,7 @@ namespace GameMuteHelper
                 Application.SetCompatibleTextRenderingDefault(false);
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.2 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.2.1 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -1549,6 +1549,7 @@ namespace GameMuteHelper
                 }
             };
             _fpsInput.LostFocus += (s, e) => CommitFps();
+            _fpsInput.GotFocus += (s, e) => _fpsInput.SelectAll();
             Controls.Add(_fpsInput);
             if (tips != null && _cpuMode)
                 tips.SetToolTip(_fpsInput, string.Format("CPU 配额模式：后台限制 CPU 占用 {0}%（不保证帧率）", _cpuPercent));
@@ -1627,6 +1628,24 @@ namespace GameMuteHelper
             LayoutChildControls();
         }
 
+        private Rectangle GetFpsBoxRect()
+        {
+            int boxH = Theme.S(28);
+            return new Rectangle(Width - Theme.S(108), (Height - boxH) / 2, Theme.S(56), boxH);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            // 点击圆角框的空白边距时，把焦点转给真正的输入框
+            if (IsManagedView && _fpsInput != null && !_fpsInput.ReadOnly
+                && GetFpsBoxRect().Contains(e.Location))
+            {
+                _fpsInput.Focus();
+                _fpsInput.SelectAll();
+            }
+        }
+
         private void LayoutChildControls()
         {
             int w = ClientSize.Width;
@@ -1639,8 +1658,10 @@ namespace GameMuteHelper
                     _actionBtn.Location = new Point(w - Theme.S(40), (h - _actionBtn.Height) / 2);
                 if (_fpsInput != null)
                 {
-                    int inH = Theme.S(18);
-                    _fpsInput.SetBounds(w - Theme.S(102), (h - inH) / 2 + 1, Theme.S(44), inH);
+                    // 单行 TextBox 的高度由字体决定，这里只把宽度撑满可见圆角框，
+                    // 并垂直居中；剩余边距由卡片转发点击处理。
+                    int inH = _fpsInput.Height;
+                    _fpsInput.SetBounds(w - Theme.S(105), (h - inH) / 2, Theme.S(50), inH);
                 }
                 if (_fpsToggle != null)
                     _fpsToggle.Location = new Point(w - Theme.S(156), (h - _fpsToggle.Height) / 2);
@@ -1728,8 +1749,7 @@ namespace GameMuteHelper
                     (_cpuMode || _rtssInstalled) ? Theme.TextMuted : Theme.TextDim,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
 
-                int boxH = Theme.S(28);
-                Rectangle fpsBox = new Rectangle(Width - Theme.S(108), (Height - boxH) / 2, Theme.S(56), boxH);
+                Rectangle fpsBox = GetFpsBoxRect();
                 bool fpsActive = _fpsToggle != null && _fpsToggle.Checked && (_cpuMode || _rtssInstalled);
                 using (GraphicsPath fp = Theme.RoundedRect(fpsBox, Theme.S(7)))
                 using (SolidBrush fbr = new SolidBrush(Theme.InputBg))
