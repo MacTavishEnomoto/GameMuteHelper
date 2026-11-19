@@ -16,10 +16,10 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyDescription("后台失焦自动静音与 RTSS / CPU 配额限帧助手")]
+[assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.3.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.3.1.0")]
+[assembly: System.Reflection.AssemblyVersion("3.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.4.0.0")]
 
 namespace GameMuteHelper
 {
@@ -86,7 +86,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.3.1 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.0 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -192,6 +192,39 @@ namespace GameMuteHelper
         }
     }
 
+    internal static class AudioModes
+    {
+        public const string Mute = "mute";
+        public const string Attenuate = "attenuate";
+
+        public const int MinVolumePercent = 5;
+        public const int MaxVolumePercent = 90;
+
+        public static string Normalize(string m)
+        {
+            return string.Equals(m, Attenuate, StringComparison.OrdinalIgnoreCase) ? Attenuate : Mute;
+        }
+
+        public static bool IsAttenuate(string m)
+        {
+            return Normalize(m) == Attenuate;
+        }
+
+        public static int ClampVolume(int v)
+        {
+            if (v < MinVolumePercent) v = MinVolumePercent;
+            if (v > MaxVolumePercent) v = MaxVolumePercent;
+            return v;
+        }
+
+        public static string ShortLabel(string m)
+        {
+            return IsAttenuate(m) ? "降低音量" : "完全静音";
+        }
+
+        public static int DefaultVolume { get { return 30; } }
+    }
+
     [DataContract]
     internal class AppRule
     {
@@ -200,6 +233,8 @@ namespace GameMuteHelper
         [DataMember] public bool Mute { get; set; }
         [DataMember] public bool LimitFps { get; set; }
         [DataMember] public int Fps { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string AudioMode { get; set; }
+        [DataMember(EmitDefaultValue = false)] public int? AudioVolume { get; set; }
 
         public AppRule()
         {
@@ -304,6 +339,10 @@ namespace GameMuteHelper
                     }
                     r.Method = LimitMethods.Normalize(r.Method);
                     r.Fps = LimitMethods.Clamp(r.Method, r.Fps);
+
+                    // 3.4：每应用音频模式（完全静音 / 降低音量），旧配置默认静音
+                    r.AudioMode = AudioModes.Normalize(r.AudioMode);
+                    r.AudioVolume = AudioModes.ClampVolume(r.AudioVolume.HasValue ? r.AudioVolume.Value : AudioModes.DefaultVolume);
                 }
             }
             catch (Exception ex)
@@ -386,6 +425,7 @@ namespace GameMuteHelper
         public uint Pid;
         public string InstanceId;
         public bool Muted;
+        public float Volume;
     }
 
     internal static class MuteCore
@@ -544,12 +584,18 @@ namespace GameMuteHelper
                         }
                         ISimpleAudioVolume vol = ctl as ISimpleAudioVolume;
                         bool muted = false;
-                        if (vol != null) vol.GetMute(out muted);
+                        float volume = 1f;
+                        if (vol != null)
+                        {
+                            vol.GetMute(out muted);
+                            vol.GetMasterVolume(out volume);
+                        }
                         result.Add(new AudioSessionInfo
                         {
                             Pid = pid,
                             InstanceId = inst ?? "",
-                            Muted = muted
+                            Muted = muted,
+                            Volume = volume
                         });
                     }
                     finally
@@ -570,6 +616,25 @@ namespace GameMuteHelper
         }
 
         public static bool SetMute(string instanceId, bool mute)
+        {
+            return ApplyToSession(instanceId, delegate(ISimpleAudioVolume vol)
+            {
+                Guid ctx = Guid.Empty;
+                return vol.SetMute(mute, ref ctx) == 0;
+            });
+        }
+
+        public static bool SetVolume(string instanceId, float level)
+        {
+            return ApplyToSession(instanceId, delegate(ISimpleAudioVolume vol)
+            {
+                Guid ctx = Guid.Empty;
+                return vol.SetMasterVolume(level, ref ctx) == 0;
+            });
+        }
+
+        // 按 InstanceId 找到会话并对 ISimpleAudioVolume 执行操作
+        private static bool ApplyToSession(string instanceId, Func<ISimpleAudioVolume, bool> action)
         {
             if (string.IsNullOrEmpty(instanceId)) return false;
             IMMDeviceEnumerator enumerator = null;
@@ -603,8 +668,7 @@ namespace GameMuteHelper
                         if (inst != instanceId) continue;
                         ISimpleAudioVolume vol = ctl as ISimpleAudioVolume;
                         if (vol == null) return false;
-                        Guid ctx = Guid.Empty;
-                        return vol.SetMute(mute, ref ctx) == 0;
+                        return action(vol);
                     }
                     finally
                     {
@@ -1686,12 +1750,18 @@ namespace GameMuteHelper
         private TextBox _fpsInput;
         private PillButton _actionBtn;
         private PillButton _methodBtn;
+        private PillButton _audioBtn;
+        private TextBox _volumeInput;
         private ContextMenuStrip _methodMenu;
+        private ContextMenuStrip _audioMenu;
         private bool _rtssInstalled;
         private string _method = LimitMethods.Rtss;
         private int _value = 5;
+        private string _audioMode = AudioModes.Mute;
+        private int _volumePercent = AudioModes.DefaultVolume;
 
         public event Action<string, bool, bool, int, string> RuleChanged;
+        public event Action<string, bool, string, int> AudioRuleChanged;
         public event Action<string> RemoveClicked;
         public event Action<string> AddClicked;
 
@@ -1708,6 +1778,12 @@ namespace GameMuteHelper
             _statusText = "—";
             _statusFg = Theme.TextMuted;
             _statusBg = Theme.InputBg;
+
+            if (rule != null)
+            {
+                _audioMode = AudioModes.Normalize(rule.AudioMode);
+                _volumePercent = AudioModes.ClampVolume(rule.AudioVolume.HasValue ? rule.AudioVolume.Value : AudioModes.DefaultVolume);
+            }
 
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -1741,6 +1817,40 @@ namespace GameMuteHelper
             _muteToggle.Checked = rule.Mute;
             _muteToggle.CheckedChanged += (s, e) => NotifyRuleChanged();
             Controls.Add(_muteToggle);
+
+            // 音频方式按钮：完全静音 / 降低音量到指定百分比
+            _audioBtn = new PillButton();
+            _audioBtn.Style = PillStyle.Subtle;
+            _audioBtn.Font = Theme.FontSmall;
+            _audioBtn.CornerRadius = 7;
+            _audioBtn.Size = new Size(Theme.S(72), Theme.S(22));
+            _audioBtn.Text = AudioModes.ShortLabel(_audioMode);
+            _audioBtn.Click += (s, e) => ShowAudioMenu();
+            if (tips != null) tips.SetToolTip(_audioBtn, "点击切换后台音频方式：完全静音或降低到指定百分比");
+            Controls.Add(_audioBtn);
+
+            _volumeInput = new TextBox();
+            _volumeInput.BorderStyle = BorderStyle.None;
+            _volumeInput.BackColor = Theme.InputBg;
+            _volumeInput.Font = Theme.FontSmallBold;
+            _volumeInput.TextAlign = HorizontalAlignment.Center;
+            _volumeInput.MaxLength = 3;
+            _volumeInput.Text = _volumePercent.ToString();
+            bool volOn = _audioMode == AudioModes.Attenuate;
+            _volumeInput.Visible = volOn;
+            _volumeInput.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.SuppressKeyPress = true;
+                    CommitVolume();
+                    this.Focus();
+                }
+            };
+            _volumeInput.LostFocus += (s, e) => CommitVolume();
+            _volumeInput.GotFocus += (s, e) => _volumeInput.SelectAll();
+            Controls.Add(_volumeInput);
+            if (tips != null) tips.SetToolTip(_volumeInput, "后台音量百分比（5–90）");
 
             _fpsToggle = new ToggleSwitch();
             _fpsToggle.Enabled = MethodAvailable(_method);
@@ -1805,6 +1915,62 @@ namespace GameMuteHelper
             LayoutChildControls();
         }
 
+        private void ShowAudioMenu()
+        {
+            if (_audioMenu == null)
+            {
+                _audioMenu = new ContextMenuStrip();
+                _audioMenu.Renderer = new LightMenuRenderer();
+                _audioMenu.BackColor = Theme.Surface;
+                _audioMenu.ForeColor = Theme.Text;
+                _audioMenu.Font = Theme.FontSmall;
+                _audioMenu.ShowImageMargin = false;
+
+                ToolStripMenuItem muteItem = new ToolStripMenuItem("完全静音");
+                muteItem.Click += (s, e) => ChangeAudioMode(AudioModes.Mute);
+                _audioMenu.Items.Add(muteItem);
+
+                ToolStripMenuItem attenItem = new ToolStripMenuItem("降低音量（可设百分比）");
+                attenItem.Click += (s, e) => ChangeAudioMode(AudioModes.Attenuate);
+                _audioMenu.Items.Add(attenItem);
+            }
+            _audioMenu.Show(_audioBtn, new Point(0, _audioBtn.Height));
+        }
+
+        private void ChangeAudioMode(string mode)
+        {
+            string m = AudioModes.Normalize(mode);
+            if (m == _audioMode) return;
+
+            _audioMode = m;
+            bool atten = AudioModes.IsAttenuate(_audioMode);
+            if (_audioBtn != null) _audioBtn.Text = AudioModes.ShortLabel(_audioMode);
+            if (_volumeInput != null)
+            {
+                _volumeInput.Visible = atten;
+                if (atten) _volumeInput.Text = _volumePercent.ToString();
+            }
+            Invalidate();
+            NotifyRuleChanged();
+        }
+
+        private int ParseVolume()
+        {
+            int val;
+            string text = _volumeInput == null ? "" : _volumeInput.Text.Trim().TrimEnd('%');
+            if (!int.TryParse(text, out val)) val = AudioModes.DefaultVolume;
+            _volumePercent = AudioModes.ClampVolume(val);
+            return _volumePercent;
+        }
+
+        private void CommitVolume()
+        {
+            if (_volumeInput == null || !_volumeInput.Visible) return;
+            int val = ParseVolume();
+            if (_volumeInput.Text != val.ToString()) _volumeInput.Text = val.ToString();
+            NotifyRuleChanged();
+        }
+
         private void BuildRunningControls(bool alreadyManaged)
         {
             _actionBtn = new PillButton();
@@ -1861,6 +2027,10 @@ namespace GameMuteHelper
             if (RuleChanged != null && _muteToggle != null && _fpsToggle != null)
             {
                 RuleChanged(ProcessName, _muteToggle.Checked, _fpsToggle.Checked, ParseValue(), _method);
+            }
+            if (AudioRuleChanged != null && _muteToggle != null)
+            {
+                AudioRuleChanged(ProcessName, _muteToggle.Checked, _audioMode, _volumePercent);
             }
         }
 
@@ -1921,6 +2091,7 @@ namespace GameMuteHelper
             if (disposing)
             {
                 if (_methodMenu != null) { _methodMenu.Dispose(); _methodMenu = null; }
+                if (_audioMenu != null) { _audioMenu.Dispose(); _audioMenu = null; }
             }
             base.Dispose(disposing);
         }
@@ -1946,6 +2117,12 @@ namespace GameMuteHelper
             return new Rectangle(Width - Theme.S(108), (Height - boxH) / 2, Theme.S(56), boxH);
         }
 
+        private Rectangle GetVolumeBoxRect()
+        {
+            int boxH = Theme.S(24);
+            return new Rectangle(Width - Theme.S(392), (Height - boxH) / 2, Theme.S(52), boxH);
+        }
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
@@ -1955,6 +2132,12 @@ namespace GameMuteHelper
             {
                 _fpsInput.Focus();
                 _fpsInput.SelectAll();
+            }
+            if (IsManagedView && _volumeInput != null && _volumeInput.Visible
+                && GetVolumeBoxRect().Contains(e.Location))
+            {
+                _volumeInput.Focus();
+                _volumeInput.SelectAll();
             }
         }
 
@@ -1981,6 +2164,13 @@ namespace GameMuteHelper
                     _methodBtn.Location = new Point(w - Theme.S(216), (h - _methodBtn.Height) / 2);
                 if (_muteToggle != null)
                     _muteToggle.Location = new Point(w - Theme.S(256), (h - _muteToggle.Height) / 2);
+                if (_audioBtn != null)
+                    _audioBtn.Location = new Point(w - Theme.S(330), (h - _audioBtn.Height) / 2);
+                if (_volumeInput != null)
+                {
+                    int vinH = _volumeInput.Height;
+                    _volumeInput.SetBounds(w - Theme.S(389), (h - vinH) / 2, Theme.S(46), vinH);
+                }
             }
             else
             {
@@ -2022,7 +2212,9 @@ namespace GameMuteHelper
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
 
-            int rightReserve = IsManagedView ? Theme.S(416) : Theme.S(204);
+            // 右侧控件（从右到左）：X(40) FPS框(108) FPS开关(156) 方式(216) 音频开关(256)
+            // 音频按钮(330) 音量框(392) 标签(440) 状态胶囊(536)
+            int rightReserve = IsManagedView ? Theme.S(536) : Theme.S(204);
             int textX = Theme.S(60);
             int textWidth = Math.Max(Theme.S(100), Width - textX - rightReserve);
 
@@ -2037,7 +2229,7 @@ namespace GameMuteHelper
 
             int pillW = Theme.S(88);
             int pillH = Theme.S(24);
-            int pillX = IsManagedView ? (Width - Theme.S(404)) : (Width - Theme.S(198));
+            int pillX = IsManagedView ? (Width - Theme.S(536)) : (Width - Theme.S(198));
             if (pillX > Theme.S(160))
             {
                 Rectangle pillRect = new Rectangle(pillX, (Height - pillH) / 2, pillW, pillH);
@@ -2054,8 +2246,8 @@ namespace GameMuteHelper
             {
                 int lblH = Theme.S(24);
                 int lblY = (Height - lblH) / 2;
-                Rectangle muteLblRect = new Rectangle(Width - Theme.S(298), lblY, Theme.S(38), lblH);
-                TextRenderer.DrawText(g, "静音", Theme.FontSmall, muteLblRect, Theme.TextMuted,
+                Rectangle muteLblRect = new Rectangle(Width - Theme.S(440), lblY, Theme.S(46), lblH);
+                TextRenderer.DrawText(g, "音频", Theme.FontSmall, muteLblRect, Theme.TextMuted,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
 
                 Rectangle fpsBox = GetFpsBoxRect();
@@ -2067,6 +2259,21 @@ namespace GameMuteHelper
                     g.FillPath(fbr, fp);
                     g.DrawPath(fbd, fp);
                 }
+
+                if (_volumeInput != null && _volumeInput.Visible)
+                {
+                    Rectangle volBox = GetVolumeBoxRect();
+                    using (GraphicsPath vp = Theme.RoundedRect(volBox, Theme.S(7)))
+                    using (SolidBrush vbr = new SolidBrush(Theme.InputBg))
+                    using (Pen vbd = new Pen(Theme.Border, 1f))
+                    {
+                        g.FillPath(vbr, vp);
+                        g.DrawPath(vbd, vp);
+                    }
+                    Rectangle pctRect = new Rectangle(volBox.X + volBox.Width - Theme.S(16), lblY, Theme.S(14), lblH);
+                    TextRenderer.DrawText(g, "%", Theme.FontSmall, pctRect, Theme.TextMuted,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
             }
         }
     }
@@ -2076,13 +2283,25 @@ namespace GameMuteHelper
     // =========================================================================
     internal class MainForm : Form
     {
+        // 我们改过的音频会话：记录原始状态；恢复失败时保留记录下个 tick 重试
+        private class AudioTrack
+        {
+            public uint Pid;             // 会话所属进程，用于孤儿记录清理
+            public bool WasMuted;        // 会话原始静音状态
+            public float WasVolume;       // 会话原始音量
+            public bool WeMuted;         // 我们设置的静音（需要解除）
+            public bool Attenuated;      // 我们降低过音量（需要写回原值）
+            public int AppliedPct;       // 当前应用的后台音量百分比
+            public DateTime LastSeenUtc; // 会话最后一次出现在枚举中
+        }
+
         private readonly EventWaitHandle _showEvent;
         private readonly bool _isAdmin;
         private readonly string _selfProcName;
 
         private ConfigData _config;
         private Dictionary<string, AppRule> _rules;
-        private Dictionary<string, bool> _mutedByUs;
+        private Dictionary<string, AudioTrack> _audioByUs;
         private Dictionary<int, int> _cpuApplied;
         private HashSet<string> _suspendWarned;
         private Dictionary<string, uint> _limitApplied;
@@ -2130,7 +2349,7 @@ namespace GameMuteHelper
             _isAdmin = isAdmin;
             using (Process cur = Process.GetCurrentProcess()) _selfProcName = cur.ProcessName;
 
-            _mutedByUs = new Dictionary<string, bool>();
+            _audioByUs = new Dictionary<string, AudioTrack>(StringComparer.OrdinalIgnoreCase);
             _cpuApplied = new Dictionary<int, int>();
             _suspendWarned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _limitApplied = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
@@ -2589,6 +2808,7 @@ namespace GameMuteHelper
                 if (managedTab)
                 {
                     card.RuleChanged += OnRuleChanged;
+                    card.AudioRuleChanged += OnAudioRuleChanged;
                     card.RemoveClicked += OnRemoveRule;
                 }
                 else
@@ -2683,11 +2903,51 @@ namespace GameMuteHelper
             SetFooterMessage(string.Format("已更新 {0} 配置（{1}）", procName, LimitMethods.ShortLabel(r.Method)));
         }
 
+        private void OnAudioRuleChanged(string procName, bool audioOn, string audioMode, int volumePercent)
+        {
+            if (!_rules.ContainsKey(procName)) return;
+            AppRule r = _rules[procName];
+            r.Mute = audioOn;
+            r.AudioMode = AudioModes.Normalize(audioMode);
+            r.AudioVolume = AudioModes.ClampVolume(volumePercent);
+
+            // 音频设置变化：立即恢复该应用所有会话的当前干预，让下个 tick 按新模式应用
+            RestoreRuleAudio(procName);
+            SaveState();
+            string modeText = AudioModes.IsAttenuate(r.AudioMode)
+                ? string.Format("后台降至 {0}%", r.AudioVolume)
+                : "后台完全静音";
+            SetFooterMessage(string.Format("已更新 {0}：{1}", procName, audioOn ? modeText : "音频干预关闭"));
+        }
+
+        // 恢复某个应用名下所有进程的音频干预记录（按 PID 找会话再恢复）
+        private void RestoreRuleAudio(string procName)
+        {
+            try
+            {
+                Process[] ps = Process.GetProcessesByName(procName);
+                if (ps.Length == 0) return;
+                HashSet<int> pids = new HashSet<int>();
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    try { pids.Add(ps[i].Id); } finally { ps[i].Dispose(); }
+                }
+                List<AudioSessionInfo> sessions = MuteCore.GetSessions();
+                for (int i = 0; i < sessions.Count; i++)
+                {
+                    AudioSessionInfo s = sessions[i];
+                    if (s.Pid > 0 && pids.Contains((int)s.Pid))
+                        RestoreSessionAudio(s.InstanceId, procName, "新设置");
+                }
+            }
+            catch { }
+        }
+
         private void OnRemoveRule(string procName)
         {
             if (!_rules.ContainsKey(procName)) return;
             _rules.Remove(procName);
-            RestoreAllMuted();
+            RestoreRuleAudio(procName);
             RestoreRuleLimits(procName);
             _inactiveSince.Remove(procName);
             _liveState.Remove(procName);
@@ -2816,7 +3076,7 @@ namespace GameMuteHelper
                     _inactiveSince.Remove(name);
                     _liveState[name] = "未运行";
                 }
-                _mutedByUs.Clear();
+                RestoreAudio(restoreFailedToo: true);
                 CpuQuotaCore.RestoreAll();
                 SuspendCore.StopAll();
                 _cpuApplied.Clear();
@@ -2879,7 +3139,10 @@ namespace GameMuteHelper
                     shouldTrigger = (now - since).TotalMilliseconds >= _config.DebounceMs;
                 }
 
+                bool attenuate = rule.Mute && AudioModes.IsAttenuate(rule.AudioMode);
+                int wantPct = AudioModes.ClampVolume(rule.AudioVolume.HasValue ? rule.AudioVolume.Value : AudioModes.DefaultVolume);
                 bool mutedNow = false;
+                int attNowPct = 0;
                 for (int i = 0; i < pids.Count; i++)
                 {
                     List<AudioSessionInfo> list;
@@ -2889,32 +3152,62 @@ namespace GameMuteHelper
                         AudioSessionInfo s = list[j];
                         if (shouldTrigger && rule.Mute)
                         {
-                            if (!_mutedByUs.ContainsKey(s.InstanceId))
+                            AudioTrack track;
+                            if (!_audioByUs.TryGetValue(s.InstanceId, out track))
                             {
-                                if (!s.Muted)
+                                track = new AudioTrack();
+                                track.Pid = s.Pid;
+                                track.WasMuted = s.Muted;
+                                track.WasVolume = s.Volume;
+                                _audioByUs[s.InstanceId] = track;
+                            }
+                            track.LastSeenUtc = now;
+
+                            if (attenuate)
+                            {
+                                // 从「静音」切到「降音量」：先解除我们自己设的静音
+                                if (track.WeMuted && MuteCore.SetMute(s.InstanceId, false)) track.WeMuted = false;
+                                if (!track.WasMuted)
+                                {
+                                    if (!track.Attenuated)
+                                    {
+                                        if (MuteCore.SetVolume(s.InstanceId, wantPct / 100f))
+                                        {
+                                            track.Attenuated = true;
+                                            track.AppliedPct = wantPct;
+                                            SetFooterMessage(string.Format("{0} 切至后台 · 音量降至 {1}%", name, wantPct));
+                                        }
+                                    }
+                                    else if (track.AppliedPct != wantPct)
+                                    {
+                                        if (MuteCore.SetVolume(s.InstanceId, wantPct / 100f))
+                                        {
+                                            track.AppliedPct = wantPct;
+                                            SetFooterMessage(string.Format("{0} 后台音量已调整为 {1}%", name, wantPct));
+                                        }
+                                    }
+                                    attNowPct = track.AppliedPct > 0 ? track.AppliedPct : wantPct;
+                                }
+                                mutedNow = true;
+                            }
+                            else
+                            {
+                                // 从「降音量」切到「静音」：先恢复我们改过的音量
+                                if (track.Attenuated && MuteCore.SetVolume(s.InstanceId, track.WasVolume)) track.Attenuated = false;
+                                if (!track.WasMuted && !track.WeMuted && !s.Muted)
                                 {
                                     if (MuteCore.SetMute(s.InstanceId, true))
                                     {
-                                        _mutedByUs[s.InstanceId] = false;
+                                        track.WeMuted = true;
                                         SetFooterMessage(name + " 切至后台 · 已静音");
                                     }
                                 }
-                                else
-                                {
-                                    _mutedByUs[s.InstanceId] = true;
-                                }
+                                mutedNow = true;
                             }
-                            mutedNow = true;
                         }
                         else
                         {
-                            bool orig;
-                            if (_mutedByUs.TryGetValue(s.InstanceId, out orig))
-                            {
-                                MuteCore.SetMute(s.InstanceId, orig);
-                                _mutedByUs.Remove(s.InstanceId);
-                                SetFooterMessage(name + " 切回前台 · 已恢复音量");
-                            }
+                            RestoreSessionAudio(s.InstanceId, name, "前台");
                         }
                     }
                 }
@@ -3042,6 +3335,16 @@ namespace GameMuteHelper
 
                 if (active)
                     _liveState[name] = "前台";
+                else if (attNowPct > 0 && suspendFailed)
+                    _liveState[name] = string.Format("降音量{0}%·挂起失败", attNowPct);
+                else if (attNowPct > 0 && appliedSuspend > 0)
+                    _liveState[name] = string.Format("降音量{0}%·挂起{1}", attNowPct, appliedSuspend);
+                else if (attNowPct > 0 && appliedCpu > 0)
+                    _liveState[name] = string.Format("降音量{0}%·CPU{1}%", attNowPct, appliedCpu);
+                else if (attNowPct > 0 && appliedFps > 0)
+                    _liveState[name] = string.Format("降音量{0}%·{1}FPS", attNowPct, appliedFps);
+                else if (attNowPct > 0)
+                    _liveState[name] = string.Format("降音量{0}%", attNowPct);
                 else if (mutedNow && suspendFailed)
                     _liveState[name] = "静音·挂起失败";
                 else if (mutedNow && appliedSuspend > 0)
@@ -3064,8 +3367,26 @@ namespace GameMuteHelper
                     _liveState[name] = "后台";
             }
 
-            List<string> stale = _mutedByUs.Keys.Where(k => !alive.Contains(k)).ToList();
-            for (int i = 0; i < stale.Count; i++) _mutedByUs.Remove(stale[i]);
+            // 关键修复：会话短暂从枚举消失（常见于快速切窗口/游戏重建会话）时，
+            // 不立即丢弃恢复记录——保留 30 秒宽限，期间持续尝试恢复。
+            // 彻底过期时先做一次最后恢复尝试（会话可能只是换了端点/设备），
+            // 再放弃；此时若会话真已销毁，静音随会话一起消失，无残留影响。
+            DateTime staleCutoff = now.AddSeconds(-30);
+            List<string> expired = new List<string>();
+            foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
+            {
+                if (alive.Contains(kv.Key)) continue;                       // 会话还活着
+                if (kv.Value.LastSeenUtc >= staleCutoff) continue;           // 短暂消失，再等等
+                expired.Add(kv.Key);                                        // 彻底过期才放弃
+            }
+            for (int i = 0; i < expired.Count; i++)
+            {
+                string id = expired[i];
+                AudioTrack t = _audioByUs[id];
+                if (t.Attenuated) { if (MuteCore.SetVolume(id, t.WasVolume)) t.Attenuated = false; }
+                if (t.WeMuted) { if (MuteCore.SetMute(id, t.WasMuted)) t.WeMuted = false; }
+                _audioByUs.Remove(id);
+            }
 
             CpuQuotaCore.Cleanup(livePids);
             SuspendCore.Cleanup(livePids);
@@ -3077,13 +3398,61 @@ namespace GameMuteHelper
             }
         }
 
+        // 恢复单个会话的音频到原始状态；失败时保留记录，下个 tick 自动重试
+        private bool RestoreSessionAudio(string instanceId, string name, string reason)
+        {
+            AudioTrack track;
+            if (!_audioByUs.TryGetValue(instanceId, out track)) return false;
+
+            bool ok = true;
+            if (track.Attenuated)
+            {
+                if (MuteCore.SetVolume(instanceId, track.WasVolume)) track.Attenuated = false;
+                else ok = false;
+            }
+            if (track.WeMuted)
+            {
+                if (MuteCore.SetMute(instanceId, track.WasMuted)) track.WeMuted = false;
+                else ok = false;
+            }
+
+            if (ok)
+            {
+                _audioByUs.Remove(instanceId);
+                SetFooterMessage(name + " 切回" + reason + " · 已恢复音量");
+                return true;
+            }
+            // 恢复失败（COM 忙、设备切换等）：保留记录，500ms 后重试
+            AppLogger.Log(string.Format("Audio restore retry: {0}", instanceId), "WARN");
+            return false;
+        }
+
+        // 恢复全部会话（暂停/移除/退出/注销时）。restoreFailedToo=true 时强制再试一轮。
+        private void RestoreAudio(bool restoreFailedToo)
+        {
+            List<string> done = new List<string>();
+            foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
+            {
+                if (!kv.Value.Attenuated && !kv.Value.WeMuted)
+                {
+                    done.Add(kv.Key); // 只是记录了原始状态还没改过，直接丢
+                    continue;
+                }
+                if (MuteCore.SetVolume(kv.Key, kv.Value.WasVolume)) kv.Value.Attenuated = false;
+                if (MuteCore.SetMute(kv.Key, kv.Value.WasMuted)) kv.Value.WeMuted = false;
+                if (!kv.Value.Attenuated && !kv.Value.WeMuted) done.Add(kv.Key);
+            }
+            for (int i = 0; i < done.Count; i++) _audioByUs.Remove(done[i]);
+            if (restoreFailedToo)
+            {
+                // 强制退出路径：即使失败也清空记录，避免残留
+                _audioByUs.Clear();
+            }
+        }
+
         private void RestoreAllMuted()
         {
-            foreach (KeyValuePair<string, bool> kv in _mutedByUs.ToList())
-            {
-                MuteCore.SetMute(kv.Key, kv.Value);
-            }
-            _mutedByUs.Clear();
+            RestoreAudio(false);
         }
 
         private void RestoreAllLimits()
@@ -3301,7 +3670,7 @@ namespace GameMuteHelper
 
         private void UpdateHeaderAndTray()
         {
-            bool throttling = _mutedByUs.Count > 0 || _limitApplied.Count > 0;
+            bool throttling = _audioByUs.Count > 0 || _limitApplied.Count > 0;
             string key = string.Format("{0}|{1}|{2}", _paused, throttling, _rules.Count);
             if (key == _lastTrayKey) return;
             _lastTrayKey = key;
@@ -3346,7 +3715,7 @@ namespace GameMuteHelper
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
             AppLogger.Log("Session ending; restoring audio and RTSS limits.");
-            RestoreAllMuted();
+            RestoreAudio(true);
             RestoreAllLimits();
         }
 
@@ -3357,7 +3726,7 @@ namespace GameMuteHelper
             AppLogger.Log("Exiting GameMuteHelper.");
             try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { }
             try { _monitorTimer.Stop(); } catch { }
-            try { RestoreAllMuted(); } catch { }
+            try { RestoreAudio(true); } catch { }
             try { RestoreAllLimits(); } catch { }
             try { _tray.Visible = false; _tray.Dispose(); } catch { }
             Application.Exit();
