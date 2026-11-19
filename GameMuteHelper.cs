@@ -253,6 +253,7 @@ namespace GameMuteHelper
     {
         [DataMember] public string Version { get; set; }
         [DataMember] public int DebounceMs { get; set; }
+        [DataMember] public int FadeMs { get; set; }
         [DataMember] public string LimitMethod { get; set; }
         [DataMember] public int CpuQuotaPercent { get; set; }
         [DataMember] public List<AppRule> Apps { get; set; }
@@ -266,6 +267,7 @@ namespace GameMuteHelper
         {
             Version = "3.3";
             DebounceMs = 500;
+            FadeMs = 500;
             LimitMethod = "rtss";
             CpuQuotaPercent = 5;
             Apps = new List<AppRule>();
@@ -302,6 +304,8 @@ namespace GameMuteHelper
 
                 if (data.DebounceMs < 0) data.DebounceMs = 0;
                 if (data.DebounceMs > 5000) data.DebounceMs = 5000;
+                if (data.FadeMs < 0) data.FadeMs = 0;          // 0 = 瞬间切换（无渐变）
+                if (data.FadeMs > 5000) data.FadeMs = 5000;
 
                 if (string.IsNullOrEmpty(data.LimitMethod)) data.LimitMethod = "rtss";
                 if (!data.LimitMethod.Equals("cpu", StringComparison.OrdinalIgnoreCase)) data.LimitMethod = "rtss";
@@ -2589,9 +2593,17 @@ namespace GameMuteHelper
         // 渐变到原值后要做什么：移除记录（回前台）/ 设静音（切回静音方式）/ 无
         private enum AfterUpKind { None, RemoveRecord, SetMute }
 
-        // 降音量/恢复的线性渐变：全程 FadeMs 毫秒，每 FadeStepMs 步进一次
-        private const int FadeMs = 1000;
+        // 降音量/恢复的线性渐变：时长由配置 FadeMs 决定（默认 500ms，0 = 瞬间切换），
+        // 步进间隔固定 50ms
         private const int FadeStepMs = 50;
+
+        // 当前生效的渐变时长（毫秒）；从配置读取，UI 修改后即时生效
+        private int _fadeMs = 500;
+
+        private int EffectiveFadeMs
+        {
+            get { return _fadeMs > 0 ? _fadeMs : 1; } // 0 视为瞬间：progress 立即到 1
+        }
 
         // 我们改过的音频会话：记录原始状态；恢复失败时保留记录下个 tick 重试
         private class AudioTrack
@@ -2646,6 +2658,7 @@ namespace GameMuteHelper
         private PillButton _pauseBtn;
         private PillButton _refreshBtn;
         private PillButton _debounceBtn;
+        private PillButton _fadeBtn;
         private PillButton _hideBtn;
         private ToggleSwitch _autostartToggle;
         private Label _statusBadge;
@@ -2654,6 +2667,7 @@ namespace GameMuteHelper
         private Panel _cardsHost;
         private Label _emptyLabel;
         private ContextMenuStrip _debounceMenu;
+        private ContextMenuStrip _fadeMenu;
 
         private NotifyIcon _tray;
         private ToolStripMenuItem _miPause;
@@ -2720,6 +2734,7 @@ namespace GameMuteHelper
                 AppRule r = _config.Apps[i];
                 if (!string.IsNullOrEmpty(r.Name)) _rules[r.Name] = r;
             }
+            _fadeMs = _config.FadeMs;
 
             // 限帧是否可用只看当前状态；RTSS 稍后会由 StartRtssAsync 自动拉起，
             // 因此这里不再把规则的 LimitFps 永久关闭。
@@ -2945,12 +2960,48 @@ namespace GameMuteHelper
             _debounceBtn.Click += (s, e) => _debounceMenu.Show(_debounceBtn, new Point(0, -_debounceMenu.PreferredSize.Height));
             footer.Controls.Add(_debounceBtn);
 
+            // 渐变时长选择：降音量/恢复的线性过渡时长
+            _fadeMenu = new ContextMenuStrip();
+            _fadeMenu.Renderer = new LightMenuRenderer();
+            _fadeMenu.BackColor = Theme.Surface;
+            _fadeMenu.ForeColor = Theme.Text;
+            _fadeMenu.Font = Theme.FontSmall;
+            _fadeMenu.ShowImageMargin = false;
+            int[] fadePresets = new int[] { 0, 200, 500, 1000, 2000, 3000 };
+            for (int i = 0; i < fadePresets.Length; i++)
+            {
+                int val = fadePresets[i];
+                ToolStripMenuItem item = new ToolStripMenuItem(val == 0 ? "0 ms (瞬间切换)" : (val + " ms"));
+                item.Click += (s, e) =>
+                {
+                    _config.FadeMs = val;
+                    _fadeMs = val;
+                    _fadeBtn.Text = string.Format("渐变 {0}ms ▾", val);
+                    SaveState();
+                    SetFooterMessage(val == 0
+                        ? "音量过渡已设为瞬间切换"
+                        : "音量渐变时长已更新为 " + val + " ms");
+                };
+                _fadeMenu.Items.Add(item);
+            }
+
+            _fadeBtn = new PillButton();
+            _fadeBtn.Text = string.Format("渐变 {0}ms ▾", _config.FadeMs);
+            _fadeBtn.Style = PillStyle.Subtle;
+            _fadeBtn.Font = Theme.FontSmall;
+            _fadeBtn.CornerRadius = 7;
+            _fadeBtn.Size = new Size(Theme.S(102), Theme.S(28));
+            _fadeBtn.Location = new Point(Theme.S(254), (footer.Height - _fadeBtn.Height) / 2);
+            _fadeBtn.Click += (s, e) => _fadeMenu.Show(_fadeBtn, new Point(0, -_fadeMenu.PreferredSize.Height));
+            _tips.SetToolTip(_fadeBtn, "切后台降音量 / 切前台恢复音量的线性过渡时长");
+            footer.Controls.Add(_fadeBtn);
+
             PillButton logBtn = new PillButton();
             logBtn.Text = "数据目录";
             logBtn.Style = PillStyle.Ghost;
             logBtn.Font = Theme.FontSmall;
             logBtn.Size = new Size(Theme.S(78), Theme.S(28));
-            logBtn.Location = new Point(Theme.S(254), (footer.Height - logBtn.Height) / 2);
+            logBtn.Location = new Point(Theme.S(366), (footer.Height - logBtn.Height) / 2);
             logBtn.Click += (s, e) => { try { Process.Start("explorer.exe", AppLogger.DataDir); } catch { } };
             footer.Controls.Add(logBtn);
 
@@ -2969,8 +3020,8 @@ namespace GameMuteHelper
             _footerStatus.ForeColor = Theme.TextMuted;
             _footerStatus.AutoEllipsis = true;
             _footerStatus.TextAlign = ContentAlignment.MiddleRight;
-            _footerStatus.Location = new Point(Theme.S(344), Theme.S(17));
-            _footerStatus.Size = new Size(Math.Max(Theme.S(80), w - Theme.S(468)), Theme.S(20));
+            _footerStatus.Location = new Point(Theme.S(456), Theme.S(17));
+            _footerStatus.Size = new Size(Math.Max(Theme.S(80), w - Theme.S(580)), Theme.S(20));
             _footerStatus.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
             _footerStatus.Text = "更改将自动保存并即时生效";
             footer.Controls.Add(_footerStatus);
@@ -3940,7 +3991,7 @@ namespace GameMuteHelper
                 string id = fading[i].Key;
                 AudioTrack t = fading[i].Value;
 
-                double progress = (now - t.FadeStartUtc).TotalMilliseconds / FadeMs;
+                double progress = (now - t.FadeStartUtc).TotalMilliseconds / EffectiveFadeMs;
                 if (progress > 1.0) progress = 1.0;
                 float level = t.FadeFrom + (t.FadeTo - t.FadeFrom) * (float)progress;
                 if (progress >= 1.0) level = t.FadeTo;
