@@ -3176,7 +3176,6 @@ namespace GameMuteHelper
                         if (!found.ContainsKey(pn) || (string.IsNullOrEmpty(found[pn]) && !string.IsNullOrEmpty(title)))
                             found[pn] = title ?? "";
 
-                        if (!found.ContainsKey(pn)) continue;
                         lock (_iconCacheSync)
                         {
                             if (!_iconCache.ContainsKey(pn) && !newIcons.ContainsKey(pn))
@@ -3388,12 +3387,17 @@ namespace GameMuteHelper
         {
             if (!_rules.ContainsKey(procName)) return;
             AppRule r = _rules[procName];
+            bool muteChanged = (r.Mute != audioOn);
+            bool modeChanged = !AudioModes.Normalize(audioMode).Equals(AudioModes.Normalize(r.AudioMode), StringComparison.OrdinalIgnoreCase);
+
             r.Mute = audioOn;
             r.AudioMode = AudioModes.Normalize(audioMode);
             r.AudioVolume = AudioModes.ClampVolume(volumePercent);
 
-            // 音频设置变化：立即恢复该应用所有会话的当前干预，让下个 tick 按新模式应用
-            RestoreRuleAudio(procName, true);
+            // 只在干预方式本身变化（静音开关 / 静音<->降音量）时才立即恢复会话。
+            // 改百分比不恢复：监控循环会从当前值平滑渐变到新目标。
+            // 此前无条件恢复，导致改 FPS 等无关设置时后台音量先跳回原值再重新渐降。
+            if (muteChanged || modeChanged) RestoreRuleAudio(procName, true);
             SaveState();
             string modeText = AudioModes.IsAttenuate(r.AudioMode)
                 ? string.Format("后台降至 {0}%", r.AudioVolume)
@@ -3681,15 +3685,30 @@ namespace GameMuteHelper
                                 {
                                     track.WasMuted = legacy.WasMuted;
                                     track.WasVolume = legacy.WasVolume;
-                                    if (legacy.Attenuated || legacy.WeMuted)
+
+                                    // 干预标志只在系统确实把状态延续到新会话时才继承：
+                                    // 静音必须真的还在（s.Muted 为真），降音量必须新会话音量
+                                    // 明显低于原值（被延续）。否则新会话是干净默认状态，
+                                    // 照搬标志会导致该静音不静音。
+                                    if (legacy.WeMuted && s.Muted)
                                     {
-                                        track.Attenuated = legacy.Attenuated;
-                                        track.WeMuted = legacy.WeMuted;
-                                        track.AppliedPct = legacy.AppliedPct;
-                                        track.CurrentLevel = legacy.CurrentLevel;
+                                        track.WeMuted = true;
+                                        track.Attenuated = false;
+                                        track.AppliedPct = 0;
+                                        track.CurrentLevel = -1f;
                                         AppLogger.Log(string.Format(
-                                            "Session rebuilt: pid={0} inheriting WasVolume={1:0.00}",
-                                            s.Pid, legacy.WasVolume), "INFO");
+                                            "Session rebuilt (mute inherited): pid={0}", s.Pid), "INFO");
+                                    }
+                                    else if (legacy.Attenuated && s.Volume + 0.005f < track.WasVolume)
+                                    {
+                                        // 新会话带着我们降过的音量回来
+                                        track.Attenuated = true;
+                                        track.WeMuted = false;
+                                        track.AppliedPct = legacy.AppliedPct;
+                                        track.CurrentLevel = s.Volume;
+                                        AppLogger.Log(string.Format(
+                                            "Session rebuilt (volume inherited): pid={0} level={1:0.00} was={2:0.00}",
+                                            s.Pid, s.Volume, track.WasVolume), "INFO");
                                     }
                                 }
                                 _audioByUs[s.InstanceId] = track;
@@ -4111,11 +4130,20 @@ namespace GameMuteHelper
                 float from = track.CurrentLevel >= 0f ? track.CurrentLevel : track.WasVolume;
                 if (Math.Abs(from - track.WasVolume) < 0.005f)
                 {
-                    // 已经等于原值，直接完成
+                    // 已经等于原值：直接完成。写回失败时保留记录下个 tick 重试，
+                    // 不能删——否则会话实际未恢复却被认为已恢复（音量卡在错误值）。
                     if (MuteCore.SetVolume(instanceId, track.WasVolume))
                     {
                         track.CurrentLevel = track.WasVolume;
                         track.Attenuated = false;
+                    }
+                    else
+                    {
+                        // 音量写回失败但继续尝试解除静音（部分恢复好过全不恢复），
+                        // ok=false 保证记录保留、下个 tick 再补一次
+                        AppLogger.Log(string.Format("Audio set-volume retry: {0}", instanceId), "WARN");
+                        if (track.WeMuted && MuteCore.SetMute(instanceId, track.WasMuted)) track.WeMuted = false;
+                        return false;
                     }
                 }
                 else
