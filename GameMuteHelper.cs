@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.4.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.4.2.0")]
+[assembly: System.Reflection.AssemblyVersion("3.4.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.4.3.0")]
 
 namespace GameMuteHelper
 {
@@ -88,7 +88,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.2 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.3 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -2676,6 +2676,7 @@ namespace GameMuteHelper
         private int _rtssUiTick;
         private bool _rtssStartInFlight;
         private bool _scanInFlight;
+        private int _lastViewIndex = -1;
         private DateTime _lastRtssAutoRestart = DateTime.MinValue;
 
         private ToolTip _tips;
@@ -3231,8 +3232,12 @@ namespace GameMuteHelper
             if (!managedTab && string.IsNullOrEmpty(q) && TrySoftRefreshRunningCards()) return;
 
             _cardsHost.SuspendLayout();
-            _cardsHost.AutoScrollPosition = new Point(0, 0);
-            _cardsHost.AutoScrollPosition = new Point(0, 0);
+            // 标签切换时重置滚动到顶部；同标签内重建（如改设置）保留滚动位置
+            if (_lastViewIndex != _tabs.SelectedIndex)
+            {
+                _cardsHost.AutoScrollPosition = new Point(0, 0);
+                _lastViewIndex = _tabs.SelectedIndex;
+            }
             for (int i = 0; i < _visibleCards.Count; i++)
             {
                 _cardsHost.Controls.Remove(_visibleCards[i]);
@@ -3313,6 +3318,14 @@ namespace GameMuteHelper
         {
             if (_visibleCards.Count == 0) return false;
 
+            // 关键：卡片必须本来就是「运行中」视图构建的。
+            // 从「已接管」标签切过来时集合可能恰好相同，但卡片上还是接管的控件，
+            // 此时软刷新会保留旧卡片不重建，界面看起来「切换后前面有个项不变」。
+            for (int i = 0; i < _visibleCards.Count; i++)
+            {
+                if (_visibleCards[i].IsManagedView) return false;
+            }
+
             // 集合一致性检查：现卡片与最新扫描的进程名集合必须完全一致（顺序无关）
             if (_visibleCards.Count != _runningTitles.Count) return false;
             HashSet<string> current = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -3346,17 +3359,26 @@ namespace GameMuteHelper
             }
         }
 
+        // 未接管卡片的实时存活进程名集合（由 MonitorStep 每次扫描更新）
+        private HashSet<string> _liveProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         private void ApplyCardStatus(AppCardControl card)
         {
             string st;
             if (_liveState.ContainsKey(card.ProcessName))
+            {
                 st = _liveState[card.ProcessName];
-            else if (_runningTitles.ContainsKey(card.ProcessName))
-                st = "运行中";
+            }
             else
-                st = "未运行";
+            {
+                // 未接管的进程：用监控循环实时维护的存活集合，不用陈旧的 _runningTitles 快照。
+                // 监控暂停或没有规则时集合不更新，此时回退到扫描快照。
+                st = _liveProcessNames.Count > 0
+                    ? (_liveProcessNames.Contains(card.ProcessName) ? "运行中" : "未运行")
+                    : (_runningTitles.ContainsKey(card.ProcessName) ? "运行中" : "未运行");
+            }
 
-            if (st.Contains("静音") || st.Contains("FPS") || st.Contains("CPU") || st.Contains("挂起"))
+            if (st.Contains("静音") || st.Contains("FPS") || st.Contains("CPU") || st.Contains("挂起") || st.Contains("降音量"))
                 card.SetStatus(st, Theme.Amber, Theme.AmberSoft);
             else if (st == "前台" || st == "运行中")
                 card.SetStatus(st, Theme.Green, Theme.GreenSoft);
@@ -3578,6 +3600,7 @@ namespace GameMuteHelper
 
             Dictionary<string, List<int>> procsByName = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
             HashSet<int> livePids = new HashSet<int>();
+            _liveProcessNames.Clear();
             Process[] allProcs = Process.GetProcesses();
             for (int i = 0; i < allProcs.Length; i++)
             {
@@ -3585,13 +3608,15 @@ namespace GameMuteHelper
                 try
                 {
                     livePids.Add(p.Id);
-                    if (_rules.ContainsKey(p.ProcessName))
+                    string pn = p.ProcessName;
+                    if (!string.IsNullOrEmpty(pn)) _liveProcessNames.Add(pn);
+                    if (_rules.ContainsKey(pn))
                     {
                         List<int> list;
-                        if (!procsByName.TryGetValue(p.ProcessName, out list))
+                        if (!procsByName.TryGetValue(pn, out list))
                         {
                             list = new List<int>();
-                            procsByName[p.ProcessName] = list;
+                            procsByName[pn] = list;
                         }
                         list.Add(p.Id);
                     }
