@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.4.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.4.1.0")]
+[assembly: System.Reflection.AssemblyVersion("3.4.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.4.2.0")]
 
 namespace GameMuteHelper
 {
@@ -88,7 +88,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.1 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.2 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -2623,6 +2623,9 @@ namespace GameMuteHelper
             public DateTime FadeStartUtc; // 渐变开始时间
             public AfterUpKind AfterUp;    // 渐变到原值后的动作
             public DateTime LastSeenUtc;  // 会话最后一次出现在枚举中
+
+            // 会话已消失超过 5 秒视为陈旧（进程重启后旧记录不能当新会话的真原值来源）
+            public bool IsStale() { return (DateTime.UtcNow - LastSeenUtc).TotalSeconds > 5.0; }
         }
 
         // 同一 PID 的旧会话记录（会话被游戏重建时，新会话要继承原值，
@@ -2632,10 +2635,22 @@ namespace GameMuteHelper
             if (pid == 0) return null;
             foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
             {
-                if (kv.Value.Pid == pid) return kv.Value;
+                if (kv.Value.Pid == pid && !kv.Value.IsStale()) return kv.Value;
             }
             return null;
         }
+
+        // 按应用名记住最近一次「可信的原始音量」。
+        // 模拟器/游戏重启后新会话会带着我们上次的静音/降音量状态出现，
+        // 此时不能把当前状态当原值（否则永远恢复不回去），要用这里记的真原值。
+        private class OriginalSnapshot
+        {
+            public bool Muted;
+            public float Volume;
+            public DateTime TimeUtc;
+        }
+        private Dictionary<string, OriginalSnapshot> _lastGoodOriginal;
+        private const int OriginalSnapshotTtlMinutes = 30;
 
         private readonly EventWaitHandle _showEvent;
         private readonly bool _isAdmin;
@@ -2697,6 +2712,7 @@ namespace GameMuteHelper
             using (Process cur = Process.GetCurrentProcess()) _selfProcName = cur.ProcessName;
 
             _audioByUs = new Dictionary<string, AudioTrack>(StringComparer.OrdinalIgnoreCase);
+            _lastGoodOriginal = new Dictionary<string, OriginalSnapshot>(StringComparer.OrdinalIgnoreCase);
             _cpuApplied = new Dictionary<int, int>();
             _suspendWarned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _limitApplied = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
@@ -3678,44 +3694,89 @@ namespace GameMuteHelper
                                 track.WasVolume = s.Volume;
                                 track.CurrentLevel = -1f;
 
-                                // 会话被游戏重建（快速切窗常见）：同 PID 的旧记录还挂着，
-                                // 继承它的原值——否则会把我们降过的音量错记为「原始音量」，
-                                // 回前台就永远恢复不到真正的原值
+                                // 会话重建（模拟器/游戏关闭重开）：新会话会带着我们上次干预的状态
+                                // （静音或降过的音量）出现。**绝不能把被污染的状态当原值**，
+                                // 否则恢复时只会写回静音/降后值，永远卡住。
                                 AudioTrack legacy = FindTrackByPid(s.Pid);
-                                if (legacy != null)
+                                OriginalSnapshot snapshot;
+                                bool hasSnapshot = _lastGoodOriginal.TryGetValue(name, out snapshot)
+                                    && (now - snapshot.TimeUtc).TotalMinutes <= OriginalSnapshotTtlMinutes;
+                                bool stateSuspicious = s.Muted || s.Volume + 0.005f < 0.9f; // 静音或音量明显非 100%
+
+                                if (legacy != null && !legacy.IsStale())
                                 {
+                                    // 同 PID 旧记录还活着：优先继承它的真原值
                                     track.WasMuted = legacy.WasMuted;
                                     track.WasVolume = legacy.WasVolume;
-
-                                    // 干预标志只在系统确实把状态延续到新会话时才继承：
-                                    // 静音必须真的还在（s.Muted 为真），降音量必须新会话音量
-                                    // 明显低于原值（被延续）。否则新会话是干净默认状态，
-                                    // 照搬标志会导致该静音不静音。
                                     if (legacy.WeMuted && s.Muted)
                                     {
                                         track.WeMuted = true;
-                                        track.Attenuated = false;
-                                        track.AppliedPct = 0;
                                         track.CurrentLevel = -1f;
                                         AppLogger.Log(string.Format(
                                             "Session rebuilt (mute inherited): pid={0}", s.Pid), "INFO");
                                     }
-                                    else if (legacy.Attenuated && s.Volume + 0.005f < track.WasVolume)
+                                    // 静音会话也可能同时带着被降低的音量：两个标志都要继承，
+                                    // 否则恢复时只解除静音、音量仍卡在 30%
+                                    if (s.Volume + 0.005f < track.WasVolume)
                                     {
-                                        // 新会话带着我们降过的音量回来
                                         track.Attenuated = true;
-                                        track.WeMuted = false;
-                                        track.AppliedPct = legacy.AppliedPct;
+                                        track.AppliedPct = (int)Math.Round(s.Volume * 100);
                                         track.CurrentLevel = s.Volume;
-                                        AppLogger.Log(string.Format(
-                                            "Session rebuilt (volume inherited): pid={0} level={1:0.00} was={2:0.00}",
-                                            s.Pid, s.Volume, track.WasVolume), "INFO");
                                     }
                                 }
+                                else if (stateSuspicious && hasSnapshot)
+                                {
+                                    // 进程重启后的新会话带着污染状态：用记住的真原值，
+                                    // 并把当前状态识别为干预残留，这样恢复才能真正解除。
+                                    track.WasMuted = snapshot.Muted;
+                                    track.WasVolume = snapshot.Volume;
+                                    // 静音和低音量是两个独立维度，必须分别标记，
+                                    // 否则只解除其中一个，另一个永久卡住
+                                    if (s.Muted) track.WeMuted = true;
+                                    if (s.Volume + 0.005f < track.WasVolume)
+                                    {
+                                        track.Attenuated = true;
+                                        track.AppliedPct = (int)Math.Round(s.Volume * 100);
+                                        track.CurrentLevel = s.Volume;
+                                    }
+                                    AppLogger.Log(string.Format(
+                                        "Session restart with stale audio state: pid={0} muted={1} vol={2:0.00} -> restore to {3:0.00}",
+                                        s.Pid, s.Muted, s.Volume, snapshot.Volume), "INFO");
+                                }
+                                else if (stateSuspicious)
+                                {
+                                    // 无可信快照：默认原值 = 未静音、100%，当前状态视为干预残留
+                                    track.WasMuted = false;
+                                    track.WasVolume = 1f;
+                                    if (s.Muted) track.WeMuted = true;
+                                    if (s.Volume + 0.005f < track.WasVolume)
+                                    {
+                                        track.Attenuated = true;
+                                        track.AppliedPct = (int)Math.Round(s.Volume * 100);
+                                        track.CurrentLevel = s.Volume;
+                                    }
+                                    AppLogger.Log(string.Format(
+                                        "Session restart, no snapshot: pid={0} treating current state as leftover", s.Pid), "INFO");
+                                }
+                                // 干净状态（100% 且未静音）：原值就是当前值，正常建记录
+
                                 _audioByUs[s.InstanceId] = track;
                             }
                             track.AppName = name;
                             track.LastSeenUtc = now;
+
+                            // 原值可信时记入快照：供进程重启后新会话恢复使用
+                            {
+                                OriginalSnapshot snap;
+                                if (!_lastGoodOriginal.TryGetValue(name, out snap))
+                                {
+                                    snap = new OriginalSnapshot();
+                                    _lastGoodOriginal[name] = snap;
+                                }
+                                snap.Muted = track.WasMuted;
+                                snap.Volume = track.WasVolume;
+                                snap.TimeUtc = now;
+                            }
 
                             if (attenuate)
                             {
@@ -3833,7 +3894,29 @@ namespace GameMuteHelper
                         }
                         else
                         {
-                            RestoreSessionAudio(s.InstanceId, name, "前台");
+                            // 前台：若该会话没有我们的记录，但状态可疑（模拟器重启后
+                            // 带着上次的静音/30% 出现），主动恢复到真原值，
+                            // 否则用户看到的就是「怎么切都没用」的卡死状态
+                            if (!_audioByUs.ContainsKey(s.InstanceId))
+                            {
+                                OriginalSnapshot snap;
+                                bool hasSnap = _lastGoodOriginal.TryGetValue(name, out snap)
+                                    && (now - snap.TimeUtc).TotalMinutes <= OriginalSnapshotTtlMinutes;
+                                bool polluted = s.Muted || (hasSnap && s.Volume + 0.005f < snap.Volume);
+                                if (polluted && !string.IsNullOrEmpty(s.InstanceId))
+                                {
+                                    float target = hasSnap ? snap.Volume : 1f;
+                                    bool okMute = !s.Muted || MuteCore.SetMute(s.InstanceId, false);
+                                    bool okVol = Math.Abs(s.Volume - target) < 0.005f || MuteCore.SetVolume(s.InstanceId, target);
+                                    if (okMute && okVol)
+                                    {
+                                        AppLogger.Log(string.Format(
+                                            "Cleared leftover audio state on foreground: pid={0} -> vol={1:0.00}",
+                                            s.Pid, target), "INFO");
+                                    }
+                                }
+                            }
+                            RestoreSessionAudio(s.InstanceId, name, "前台", AfterUpKind.RemoveRecord, s.Volume, s.Muted);
                         }
                     }
                 }
@@ -4111,28 +4194,50 @@ namespace GameMuteHelper
         // 恢复单个会话的音频到原始状态（默认：渐变完成后移除记录）
         private bool RestoreSessionAudio(string instanceId, string name, string reason)
         {
-            return RestoreSessionAudio(instanceId, name, reason, AfterUpKind.RemoveRecord);
+            return RestoreSessionAudio(instanceId, name, reason, AfterUpKind.RemoveRecord, -1f, false);
         }
 
-        private bool RestoreSessionAudio(string instanceId, string name, string reason, AfterUpKind afterUp)
+        // 带会话实际状态的重载：监控循环里直接传入，避免重复 COM 枚举。
+        // actualVolume < 0 表示调用方没有实际状态，会自行枚举一次。
+        private bool RestoreSessionAudio(string instanceId, string name, string reason, AfterUpKind afterUp,
+                                         float actualVolume, bool actualMuted)
         {
             AudioTrack track;
             if (!_audioByUs.TryGetValue(instanceId, out track)) return false;
 
-            // 有音量干预：启动向上渐变（从当前值到原值，约 1 秒），完成后再执行后续动作
-            if (track.Attenuated)
+            // 以会话实际状态为准：若偏离原值则启动向上渐变。
+            // 不能只依赖 track.Attenuated 标志——标志可能在建记录时不完整，
+            // 导致音量卡在 30%（静音解除了但音量没恢复）。
+            if (actualVolume < 0f)
+            {
+                List<AudioSessionInfo> nowSessions = MuteCore.GetSessions();
+                for (int k = 0; k < nowSessions.Count; k++)
+                {
+                    if (nowSessions[k].InstanceId == instanceId)
+                    {
+                        actualVolume = nowSessions[k].Volume;
+                        actualMuted = nowSessions[k].Muted;
+                        break;
+                    }
+                }
+            }
+            bool volumeNeedsRestore = actualVolume >= 0f && Math.Abs(actualVolume - track.WasVolume) >= 0.005f;
+
+            // 有音量干预或实际音量偏离原值：启动向上渐变
+            if (track.Attenuated || volumeNeedsRestore)
             {
                 if (track.Fade == FadeKind.Up)
                 {
-                    // 已在向上渐变（可能由静音方式切换发起）：只更新完成动作，不重启计时
+                    // 已在向上渐变：只更新完成动作，不重启计时
                     track.AfterUp = afterUp;
                     return false;
                 }
-                float from = track.CurrentLevel >= 0f ? track.CurrentLevel : track.WasVolume;
+                float from = volumeNeedsRestore ? actualVolume
+                    : (track.CurrentLevel >= 0f ? track.CurrentLevel : track.WasVolume);
+                track.Attenuated = true;
                 if (Math.Abs(from - track.WasVolume) < 0.005f)
                 {
-                    // 已经等于原值：直接完成。写回失败时保留记录下个 tick 重试，
-                    // 不能删——否则会话实际未恢复却被认为已恢复（音量卡在错误值）。
+                    // 已经等于原值：直接写入确认。失败时保留记录下个 tick 重试。
                     if (MuteCore.SetVolume(instanceId, track.WasVolume))
                     {
                         track.CurrentLevel = track.WasVolume;
@@ -4140,10 +4245,8 @@ namespace GameMuteHelper
                     }
                     else
                     {
-                        // 音量写回失败但继续尝试解除静音（部分恢复好过全不恢复），
-                        // ok=false 保证记录保留、下个 tick 再补一次
                         AppLogger.Log(string.Format("Audio set-volume retry: {0}", instanceId), "WARN");
-                        if (track.WeMuted && MuteCore.SetMute(instanceId, track.WasMuted)) track.WeMuted = false;
+                        if (actualMuted && MuteCore.SetMute(instanceId, track.WasMuted)) { /* mute fixed */ }
                         return false;
                     }
                 }
@@ -4155,13 +4258,13 @@ namespace GameMuteHelper
                     track.FadeStartUtc = DateTime.UtcNow;
                     track.AfterUp = afterUp;
                     SetFooterMessage(name + " 切回" + reason + " · 音量渐变恢复中");
-                    return false; // 渐变完成后由 FinishFade 处理后续
+                    return false;
                 }
             }
 
-            // 静音干预或无干预：立即解除（静音切换本身没有渐变，保持瞬时）
+            // 静音干预或实际仍静音（但原值非静音）：立即解除
             bool ok = true;
-            if (track.WeMuted)
+            if (track.WeMuted || (actualMuted && !track.WasMuted))
             {
                 if (MuteCore.SetMute(instanceId, track.WasMuted)) track.WeMuted = false;
                 else ok = false;
