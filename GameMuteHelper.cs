@@ -2250,6 +2250,7 @@ namespace GameMuteHelper
             _fpsSpinner.Enabled = _fpsToggle.Checked;
             _fpsSpinner.EditCommitted += (s, e) => CommitValue();
             if (tips != null) tips.SetToolTip(_fpsSpinner, ValueTooltip(_method) + "；点击数字直接输入，箭头 ±5");
+            Controls.Add(_fpsSpinner);
 
             // 每个应用独立的限帧方式选择
             _methodBtn = new PillButton();
