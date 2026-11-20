@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 RTSS / CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.4.3.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.4.3.0")]
+[assembly: System.Reflection.AssemblyVersion("3.4.4.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.4.4.0")]
 
 namespace GameMuteHelper
 {
@@ -88,7 +88,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.3 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.4 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -2584,6 +2584,42 @@ namespace GameMuteHelper
         }
     }
 
+    // 滚轮转发过滤器：按鼠标位置滚动卡片容器，
+    // 解决焦点在搜索框时鼠标停在列表上无法滚动的问题
+    internal class WheelScrollFilter : IMessageFilter
+    {
+        private const int WM_MOUSEWHEEL = 0x020A;
+
+        private readonly MainForm _form;
+
+        public WheelScrollFilter(MainForm form) { _form = form; }
+
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != WM_MOUSEWHEEL) return false;
+            if (_form == null || _form.IsDisposed || !_form.Visible) return false;
+
+            // 鼠标在卡片列表区域内才处理
+            Point pt = Control.MousePosition;
+            Panel host = _form.CardsHost;
+            if (host == null || host.IsDisposed) return false;
+            Rectangle hostRect = host.RectangleToScreen(host.ClientRectangle);
+            if (!hostRect.Contains(pt)) return false;
+
+            // AutoScrollPosition 向上滚时为 0，向下滚时为负值
+            // 滚轮 delta 在 WParam 的 high-order word（有符号 16 位），向上为正
+            int delta = unchecked((short)((m.WParam.ToInt64() >> 16) & 0xffff));
+            int step = Math.Max(30, host.Font.Height * 3);
+            Point cur = host.AutoScrollPosition; // Y <= 0
+            int newY = delta > 0 ? cur.Y + step : cur.Y - step;
+            int maxY = host.VerticalScroll.Maximum - host.ClientSize.Height + host.Padding.Vertical;
+            if (newY > 0) newY = 0;
+            if (newY < -maxY) newY = -maxY;
+            host.AutoScrollPosition = new Point(-cur.X, newY);
+            return true; // 已处理，阻止原焦点控件也滚动
+        }
+    }
+
     // =========================================================================
     // 6. Main Application Form & Real-Time Monitor
     // =========================================================================
@@ -2705,6 +2741,7 @@ namespace GameMuteHelper
         private Icon _iconPaused;
         private System.Windows.Forms.Timer _monitorTimer;
         private System.Windows.Forms.Timer _fadeTimer;
+        private IMessageFilter _wheelFilter;
 
         public MainForm(EventWaitHandle showEvent, bool startBackground, bool isAdmin)
         {
@@ -2747,6 +2784,11 @@ namespace GameMuteHelper
             _fadeTimer.Interval = FadeStepMs;
             _fadeTimer.Tick += delegate { try { FadeTick(); } catch (Exception ex) { AppLogger.Log("Fade tick error: " + ex.Message, "ERROR"); } };
             _fadeTimer.Start();
+
+            // 滚轮转发：WinForms 把滚轮交给焦点控件（如搜索框），
+            // 导致鼠标停在卡片列表上却无法滚动。按鼠标位置转发给卡片容器。
+            _wheelFilter = new WheelScrollFilter(this);
+            Application.AddMessageFilter(_wheelFilter);
 
             if (startBackground)
             {
@@ -3565,6 +3607,9 @@ namespace GameMuteHelper
                 }
             }
         }
+
+        // 供滚轮转发过滤器访问卡片容器
+        internal Panel CardsHost { get { return _cardsHost; } }
 
         private void SetFooterMessage(string msg)
         {
@@ -4624,6 +4669,7 @@ namespace GameMuteHelper
             AppLogger.Log("Exiting GameMuteHelper.");
             try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { }
             try { _monitorTimer.Stop(); } catch { }
+            try { if (_wheelFilter != null) Application.RemoveMessageFilter(_wheelFilter); } catch { }
             try { RestoreAudio(true); } catch { }
             try { RestoreAllLimits(); } catch { }
             try { _tray.Visible = false; _tray.Dispose(); } catch { }
