@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -16,10 +16,10 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 RTSS / CPU 配额限帧助手")]
+[assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.4.4.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.4.4.0")]
+[assembly: System.Reflection.AssemblyVersion("3.5.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.5.0.0")]
 
 namespace GameMuteHelper
 {
@@ -88,7 +88,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.4.4 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.5.0 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -161,7 +161,8 @@ namespace GameMuteHelper
 
     internal static class LimitMethods
     {
-        public const string Rtss = "rtss";
+        // Rtss 常量保留仅用于旧配置迁移（迁移到 Cpu），不再提供 UI 与运行时支持
+        private const string RtssLegacy = "rtss";
         public const string Cpu = "cpu";
         public const string Suspend = "suspend";
 
@@ -169,12 +170,15 @@ namespace GameMuteHelper
         {
             if (string.Equals(m, Cpu, StringComparison.OrdinalIgnoreCase)) return Cpu;
             if (string.Equals(m, Suspend, StringComparison.OrdinalIgnoreCase)) return Suspend;
-            return Rtss;
+            return Cpu; // 默认/旧 rtss 配置一律迁移为 CPU 配额
         }
+
+        public static bool IsCpu(string m) { return Normalize(m) == Cpu; }
+        public static bool IsSuspend(string m) { return Normalize(m) == Suspend; }
 
         public static int Clamp(string m, int v)
         {
-            int max = Normalize(m) == Cpu ? 100 : 240;
+            int max = IsCpu(m) ? 100 : 240;
             if (v < 1) v = 1;
             if (v > max) v = max;
             return v;
@@ -182,15 +186,12 @@ namespace GameMuteHelper
 
         public static string ShortLabel(string m)
         {
-            string n = Normalize(m);
-            if (n == Cpu) return "CPU";
-            if (n == Suspend) return "挂起";
-            return "RTSS";
+            return IsSuspend(m) ? "挂起" : "CPU";
         }
 
         public static string DisplayValue(string m, int v)
         {
-            return Normalize(m) == Cpu ? v + "%" : v.ToString();
+            return IsCpu(m) ? v + "%" : v.ToString();
         }
     }
 
@@ -241,7 +242,7 @@ namespace GameMuteHelper
         public AppRule()
         {
             Name = "";
-            Method = LimitMethods.Rtss;
+            Method = LimitMethods.Cpu;
             Mute = true;
             LimitFps = false;
             Fps = 5;
@@ -254,10 +255,7 @@ namespace GameMuteHelper
         [DataMember] public string Version { get; set; }
         [DataMember] public int DebounceMs { get; set; }
         [DataMember] public int FadeMs { get; set; }
-        [DataMember] public string LimitMethod { get; set; }
-        [DataMember] public int CpuQuotaPercent { get; set; }
         [DataMember] public List<AppRule> Apps { get; set; }
-        [DataMember] public Dictionary<string, uint> OriginalLimits { get; set; }
 
         [DataMember(EmitDefaultValue = false)] public List<string> Watch { get; set; }
         [DataMember(EmitDefaultValue = false)] public int? TargetFps { get; set; }
@@ -268,10 +266,7 @@ namespace GameMuteHelper
             Version = "3.3";
             DebounceMs = 500;
             FadeMs = 500;
-            LimitMethod = "rtss";
-            CpuQuotaPercent = 5;
             Apps = new List<AppRule>();
-            OriginalLimits = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         }
     }
 
@@ -297,19 +292,11 @@ namespace GameMuteHelper
                 }
 
                 if (data.Apps == null) data.Apps = new List<AppRule>();
-                if (data.OriginalLimits == null)
-                    data.OriginalLimits = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
-                else
-                    data.OriginalLimits = new Dictionary<string, uint>(data.OriginalLimits, StringComparer.OrdinalIgnoreCase);
 
                 if (data.DebounceMs < 0) data.DebounceMs = 0;
                 if (data.DebounceMs > 5000) data.DebounceMs = 5000;
                 if (data.FadeMs < 0) data.FadeMs = 0;          // 0 = 瞬间切换（无渐变）
                 if (data.FadeMs > 5000) data.FadeMs = 5000;
-
-                if (string.IsNullOrEmpty(data.LimitMethod)) data.LimitMethod = "rtss";
-                if (!data.LimitMethod.Equals("cpu", StringComparison.OrdinalIgnoreCase)) data.LimitMethod = "rtss";
-                if (data.CpuQuotaPercent < 1 || data.CpuQuotaPercent > 100) data.CpuQuotaPercent = 5;
 
                 if (data.Apps.Count == 0 && data.Watch != null && data.Watch.Count > 0)
                 {
@@ -330,19 +317,7 @@ namespace GameMuteHelper
                 for (int i = 0; i < data.Apps.Count; i++)
                 {
                     AppRule r = data.Apps[i];
-                    if (string.IsNullOrEmpty(r.Method))
-                    {
-                        // 3.2 及更早版本是全局方式，迁移到每个应用自己的 Method
-                        if (string.Equals(data.LimitMethod, "cpu", StringComparison.OrdinalIgnoreCase) && r.LimitFps)
-                        {
-                            r.Method = LimitMethods.Cpu;
-                            r.Fps = data.CpuQuotaPercent;
-                        }
-                        else
-                        {
-                            r.Method = LimitMethods.Rtss;
-                        }
-                    }
+                    // 旧配置的 rtss 方式在 Normalize 里统一迁移为 CPU 配额
                     r.Method = LimitMethods.Normalize(r.Method);
                     r.Fps = LimitMethods.Clamp(r.Method, r.Fps);
 
@@ -694,190 +669,6 @@ namespace GameMuteHelper
         }
     }
 
-    internal static class RtssBridge
-    {
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern IntPtr LoadLibrary(string lpFileName);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
-        private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-        private delegate void LoadProfileDelegate(string profile);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private delegate bool GetProfilePropertyDelegate(string name, byte[] data, uint size);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private delegate bool SetProfilePropertyDelegate(string name, byte[] data, uint size);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-        private delegate void SaveProfileDelegate(string profile);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate void UpdateProfilesDelegate();
-
-        private static IntPtr _hMod = IntPtr.Zero;
-        private static LoadProfileDelegate _loadProfile;
-        private static GetProfilePropertyDelegate _getProp;
-        private static SetProfilePropertyDelegate _setProp;
-        private static SaveProfileDelegate _saveProfile;
-        private static UpdateProfilesDelegate _updateProfiles;
-
-        public static string RtssDir { get; private set; }
-        public static bool IsInstalled { get { return _hMod != IntPtr.Zero; } }
-        public static bool IsRunning { get { return IsRtssProcessRunning(); } }
-
-        public static bool Initialize()
-        {
-            if (IsInstalled) return true;
-            string dllName = Environment.Is64BitProcess ? "RTSSHooks64.dll" : "RTSSHooks.dll";
-            List<string> candidates = new List<string>();
-
-            string[] regKeys = new string[]
-            {
-                @"SOFTWARE\WOW6432Node\Unwinder\RTSS",
-                @"SOFTWARE\Unwinder\RTSS",
-                @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\RTSS",
-                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RTSS"
-            };
-            for (int i = 0; i < regKeys.Length; i++)
-            {
-                try
-                {
-                    using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regKeys[i]))
-                    {
-                        if (key == null) continue;
-                        string[] vals = new string[] { "InstallDir", "InstallPath", "InstallLocation" };
-                        for (int v = 0; v < vals.Length; v++)
-                        {
-                            object o = key.GetValue(vals[v]);
-                            if (o != null)
-                            {
-                                string s = o.ToString();
-                                if (s.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) s = Path.GetDirectoryName(s);
-                                if (!string.IsNullOrEmpty(s)) candidates.Add(s);
-                            }
-                        }
-                    }
-                }
-                catch { }
-            }
-
-            try
-            {
-                Process[] rtssProcs = Process.GetProcessesByName("RTSS");
-                for (int i = 0; i < rtssProcs.Length; i++)
-                {
-                    try
-                    {
-                        string fn = rtssProcs[i].MainModule.FileName;
-                        if (!string.IsNullOrEmpty(fn)) candidates.Add(Path.GetDirectoryName(fn));
-                    }
-                    catch { }
-                    finally { rtssProcs[i].Dispose(); }
-                }
-            }
-            catch { }
-
-            candidates.Add(@"C:\Program Files (x86)\RivaTuner Statistics Server");
-            candidates.Add(@"C:\Program Files\RivaTuner Statistics Server");
-
-            for (int i = 0; i < candidates.Count; i++)
-            {
-                string dir = candidates[i];
-                if (string.IsNullOrEmpty(dir)) continue;
-                string dllPath = Path.Combine(dir, dllName);
-                if (!File.Exists(dllPath)) continue;
-
-                IntPtr h = LoadLibrary(dllPath);
-                if (h == IntPtr.Zero) continue;
-
-                IntPtr pLoad = GetProcAddress(h, "LoadProfile");
-                IntPtr pGet = GetProcAddress(h, "GetProfileProperty");
-                IntPtr pSet = GetProcAddress(h, "SetProfileProperty");
-                IntPtr pSave = GetProcAddress(h, "SaveProfile");
-                IntPtr pUpd = GetProcAddress(h, "UpdateProfiles");
-                if (pLoad == IntPtr.Zero || pGet == IntPtr.Zero || pSet == IntPtr.Zero || pSave == IntPtr.Zero || pUpd == IntPtr.Zero)
-                    continue;
-
-                _loadProfile = (LoadProfileDelegate)Marshal.GetDelegateForFunctionPointer(pLoad, typeof(LoadProfileDelegate));
-                _getProp = (GetProfilePropertyDelegate)Marshal.GetDelegateForFunctionPointer(pGet, typeof(GetProfilePropertyDelegate));
-                _setProp = (SetProfilePropertyDelegate)Marshal.GetDelegateForFunctionPointer(pSet, typeof(SetProfilePropertyDelegate));
-                _saveProfile = (SaveProfileDelegate)Marshal.GetDelegateForFunctionPointer(pSave, typeof(SaveProfileDelegate));
-                _updateProfiles = (UpdateProfilesDelegate)Marshal.GetDelegateForFunctionPointer(pUpd, typeof(UpdateProfilesDelegate));
-                _hMod = h;
-                RtssDir = dir;
-                return true;
-            }
-            return false;
-        }
-
-        public static bool EnsureRunning()
-        {
-            if (!IsInstalled || string.IsNullOrEmpty(RtssDir)) return false;
-            string exePath = Path.Combine(RtssDir, "RTSS.exe");
-            if (!File.Exists(exePath)) return false;
-            if (IsRtssProcessRunning()) return true;
-
-            try
-            {
-                Process.Start(exePath);
-                for (int i = 0; i < 10; i++)
-                {
-                    Thread.Sleep(250);
-                    if (IsRtssProcessRunning()) return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Log("Failed to launch RTSS: " + ex.Message, "WARN");
-            }
-            return IsRtssProcessRunning();
-        }
-
-        private static bool IsRtssProcessRunning()
-        {
-            Process[] ps = Process.GetProcessesByName("RTSS");
-            bool running = ps.Length > 0;
-            for (int i = 0; i < ps.Length; i++) ps[i].Dispose();
-            return running;
-        }
-
-        public static uint GetLimit(string exe)
-        {
-            if (!IsInstalled) return 0;
-            try
-            {
-                _loadProfile(exe);
-                byte[] buf = new byte[4];
-                if (_getProp("FramerateLimit", buf, 4))
-                    return BitConverter.ToUInt32(buf, 0);
-            }
-            catch { }
-            return 0;
-        }
-
-        public static bool SetLimit(string exe, uint limit)
-        {
-            if (!IsInstalled) return false;
-            try
-            {
-                _loadProfile(exe);
-                byte[] buf = BitConverter.GetBytes(limit);
-                if (_setProp("FramerateLimit", buf, 4))
-                {
-                    _saveProfile(exe);
-                    _updateProfiles();
-                    return true;
-                }
-            }
-            catch { }
-            return false;
-        }
-    }
 
     // =========================================================================
     // CPU 配额限速（Job Object）— 只限制 CPU 时间占比，不直接控制帧率
@@ -1047,7 +838,7 @@ namespace GameMuteHelper
         {
             changed = false;
             if (pid <= 0) return false;
-            fps = LimitMethods.Clamp(LimitMethods.Rtss, fps);
+            fps = LimitMethods.Clamp(LimitMethods.Suspend, fps);
 
             lock (Sync)
             {
@@ -1169,6 +960,11 @@ namespace GameMuteHelper
         public static bool IsActive(int pid)
         {
             lock (Sync) { return Workers.ContainsKey(pid); }
+        }
+
+        public static bool HasActiveWorkers()
+        {
+            lock (Sync) { return Workers.Count > 0; }
         }
 
         public static bool HasFailed(int pid)
@@ -2140,8 +1936,7 @@ namespace GameMuteHelper
         private PillButton _audioBtn;
         private ContextMenuStrip _methodMenu;
         private ContextMenuStrip _audioMenu;
-        private bool _rtssInstalled;
-        private string _method = LimitMethods.Rtss;
+        private string _method = LimitMethods.Cpu;
         private int _value = 5;
         private string _audioMode = AudioModes.Mute;
         private int _volumePercent = AudioModes.DefaultVolume;
@@ -2152,14 +1947,13 @@ namespace GameMuteHelper
         public event Action<string> AddClicked;
 
         public AppCardControl(string procName, string title, Image icon, bool isManagedView,
-                              AppRule rule, bool alreadyManaged, bool rtssInstalled, ToolTip tips,
+                              AppRule rule, bool alreadyManaged, ToolTip tips,
                               string method)
         {
             ProcessName = procName;
             _windowTitle = title ?? "";
             _appIcon = icon;
             IsManagedView = isManagedView;
-            _rtssInstalled = rtssInstalled;
             _method = LimitMethods.Normalize(method);
             _statusText = "—";
             _statusFg = Theme.TextMuted;
@@ -2348,17 +2142,14 @@ namespace GameMuteHelper
             LayoutChildControls();
         }
 
-        private bool MethodAvailable(string method)
-        {
-            return LimitMethods.Normalize(method) != LimitMethods.Rtss || _rtssInstalled;
-        }
+        // RTSS 方式已移除：CPU 与挂起两种方式始终可用
+        private bool MethodAvailable(string method) { return true; }
 
         private static string ValueTooltip(string method)
         {
             string m = LimitMethods.Normalize(method);
-            if (m == LimitMethods.Cpu) return "CPU 配额：后台限制 CPU 占用百分比（不保证帧率）";
             if (m == LimitMethods.Suspend) return "挂起进程：后台按每秒次数周期性挂起/放行（实验性）";
-            return "RTSS：后台目标帧率";
+            return "CPU 配额：后台限制 CPU 占用百分比（不保证帧率）";
         }
 
         private int ParseValue()
@@ -2398,10 +2189,6 @@ namespace GameMuteHelper
                 _methodMenu.ForeColor = Theme.Text;
                 _methodMenu.Font = Theme.FontSmall;
                 _methodMenu.ShowImageMargin = false;
-
-                ToolStripMenuItem rtss = new ToolStripMenuItem("RTSS 精确限帧（按 FPS）");
-                rtss.Click += (s, e) => ChangeMethod(LimitMethods.Rtss);
-                _methodMenu.Items.Add(rtss);
 
                 ToolStripMenuItem cpu = new ToolStripMenuItem("CPU 配额（按百分比）");
                 cpu.Click += (s, e) => ChangeMethod(LimitMethods.Cpu);
@@ -2599,23 +2386,29 @@ namespace GameMuteHelper
             if (m.Msg != WM_MOUSEWHEEL) return false;
             if (_form == null || _form.IsDisposed || !_form.Visible) return false;
 
-            // 鼠标在卡片列表区域内才处理
+            // 鼠标在卡片列表区域内才处理（用 Bounds 覆盖滚动条区域）
             Point pt = Control.MousePosition;
             Panel host = _form.CardsHost;
             if (host == null || host.IsDisposed) return false;
-            Rectangle hostRect = host.RectangleToScreen(host.ClientRectangle);
+            Rectangle hostRect = host.Parent != null
+                ? host.Parent.RectangleToScreen(host.Bounds)
+                : host.RectangleToScreen(host.ClientRectangle);
             if (!hostRect.Contains(pt)) return false;
 
-            // AutoScrollPosition 向上滚时为 0，向下滚时为负值
             // 滚轮 delta 在 WParam 的 high-order word（有符号 16 位），向上为正
             int delta = unchecked((short)((m.WParam.ToInt64() >> 16) & 0xffff));
             int step = Math.Max(30, host.Font.Height * 3);
-            Point cur = host.AutoScrollPosition; // Y <= 0
-            int newY = delta > 0 ? cur.Y + step : cur.Y - step;
-            int maxY = host.VerticalScroll.Maximum - host.ClientSize.Height + host.Padding.Vertical;
-            if (newY > 0) newY = 0;
-            if (newY < -maxY) newY = -maxY;
-            host.AutoScrollPosition = new Point(-cur.X, newY);
+
+            // AutoScrollPosition 的约定：getter 返回负值（向下滚为负），
+            // setter 却要求正值（向下滚为正）。之前把负值直接传给 setter，
+            // 每次滚动都被钳回 0，列表永远滑不动。
+            int curDown = -host.AutoScrollPosition.Y; // 当前向下滚动量（>= 0）
+            int newDown = delta > 0 ? curDown - step : curDown + step;
+            int maxDown = host.VerticalScroll.Maximum; // 最大可滚动范围
+            if (newDown < 0) newDown = 0;
+            if (newDown > maxDown) newDown = maxDown;
+            Point cur = host.AutoScrollPosition;
+            host.AutoScrollPosition = new Point(-cur.X, newDown);
             return true; // 已处理，阻止原焦点控件也滚动
         }
     }
@@ -2697,7 +2490,6 @@ namespace GameMuteHelper
         private Dictionary<string, AudioTrack> _audioByUs;
         private Dictionary<int, int> _cpuApplied;
         private HashSet<string> _suspendWarned;
-        private Dictionary<string, uint> _limitApplied;
         private Dictionary<string, DateTime> _inactiveSince;
         private Dictionary<string, string> _liveState;
         private Dictionary<string, Image> _iconCache;
@@ -2705,21 +2497,16 @@ namespace GameMuteHelper
         private Dictionary<string, string> _runningTitles;
         private List<AppCardControl> _visibleCards;
 
-        private bool _rtssAvailable;
         private bool _paused;
         private bool _exiting;
         private string _lastTrayKey = "";
-        private int _rtssUiTick;
-        private bool _rtssStartInFlight;
         private bool _scanInFlight;
         private int _lastViewIndex = -1;
-        private DateTime _lastRtssAutoRestart = DateTime.MinValue;
 
         private ToolTip _tips;
         private SegmentedTabs _tabs;
         private SearchInput _searchInput;
         private PillButton _addExeBtn;
-        private PillButton _startRtssBtn;
         private PillButton _pauseBtn;
         private PillButton _refreshBtn;
         private PillButton _debounceBtn;
@@ -2727,7 +2514,6 @@ namespace GameMuteHelper
         private PillButton _hideBtn;
         private ToggleSwitch _autostartToggle;
         private Label _statusBadge;
-        private Label _rtssBadge;
         private Label _footerStatus;
         private Panel _cardsHost;
         private Label _emptyLabel;
@@ -2753,7 +2539,6 @@ namespace GameMuteHelper
             _lastGoodOriginal = new Dictionary<string, OriginalSnapshot>(StringComparer.OrdinalIgnoreCase);
             _cpuApplied = new Dictionary<int, int>();
             _suspendWarned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            _limitApplied = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
             _inactiveSince = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
             _liveState = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             _iconCache = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
@@ -2761,15 +2546,12 @@ namespace GameMuteHelper
             _visibleCards = new List<AppCardControl>();
 
             Theme.InitScale(this);
-            RtssBridge.Initialize();
             LoadState();
             BuildIcons();
             BuildUI();
             BuildTray();
-            if (AnyRuleUsesRtss()) StartRtssAsync(false); // 启动时顺带拉起 RTSS（若已安装且未运行）
 
             SystemEvents.SessionEnding += OnSessionEnding;
-            RecoverFromCrash();
             ScanRunningProcesses(); // 后台扫描；首次结果通过 BeginInvoke 回填并按需刷新
             RebuildCardList();
             UpdateHeaderAndTray();
@@ -2807,10 +2589,6 @@ namespace GameMuteHelper
                 if (!string.IsNullOrEmpty(r.Name)) _rules[r.Name] = r;
             }
             _fadeMs = _config.FadeMs;
-
-            // 限帧是否可用只看当前状态；RTSS 稍后会由 StartRtssAsync 自动拉起，
-            // 因此这里不再把规则的 LimitFps 永久关闭。
-            if (RtssBridge.IsInstalled) _rtssAvailable = RtssBridge.IsRunning;
         }
 
         private void SaveState()
@@ -2911,18 +2689,6 @@ namespace GameMuteHelper
             };
             header.Controls.Add(_tabs);
 
-            // 手动启动 RTSS（仅在已安装但未运行时显示）
-            _startRtssBtn = new PillButton();
-            _startRtssBtn.Text = "启动 RTSS";
-            _startRtssBtn.Style = PillStyle.Subtle;
-            _startRtssBtn.Font = Theme.FontSmall;
-            _startRtssBtn.Size = new Size(Theme.S(104), Theme.S(34));
-            _startRtssBtn.Location = new Point(Theme.S(200), btnY);
-            _startRtssBtn.Visible = false;
-            _startRtssBtn.Click += (s, e) => StartRtssAsync(true);
-            _tips.SetToolTip(_startRtssBtn, "启动 RivaTuner Statistics Server（后台限帧需要）");
-            header.Controls.Add(_startRtssBtn);
-
             // --- 2. Airy Search & Status Bar ---
             Panel toolbar = new Panel();
             toolbar.Size = new Size(w, Theme.S(56));
@@ -2949,25 +2715,6 @@ namespace GameMuteHelper
                 SetFooterMessage("正在后台刷新运行中的程序列表...");
             };
             toolbar.Controls.Add(_refreshBtn);
-
-            _rtssBadge = new Label();
-            _rtssBadge.Font = Theme.FontSmall;
-            _rtssBadge.AutoSize = false;
-            _rtssBadge.Size = new Size(Theme.S(250), Theme.S(24));
-            _rtssBadge.TextAlign = ContentAlignment.MiddleRight;
-            _rtssBadge.Location = new Point(w - Theme.S(272), Theme.S(17));
-            _rtssBadge.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            if (RtssBridge.IsInstalled)
-            {
-                _rtssBadge.Text = "● RTSS 已就绪 · 支持后台限帧";
-                _rtssBadge.ForeColor = Theme.Green;
-            }
-            else
-            {
-                _rtssBadge.Text = "○ 未检测到 RTSS · 仅静音可用";
-                _rtssBadge.ForeColor = Theme.TextMuted;
-            }
-            toolbar.Controls.Add(_rtssBadge);
 
             // --- 3. Unified Light Minimalist Footer (No ugly Win32 ComboBox) ---
             Panel footer = new Panel();
@@ -3318,7 +3065,7 @@ namespace GameMuteHelper
                 lock (_iconCacheSync) { if (_iconCache.ContainsKey(name)) icon = _iconCache[name]; }
                 AppRule rule = _rules.ContainsKey(name) ? _rules[name] : null;
                 AppCardControl card = new AppCardControl(name, title, icon, managedTab, rule, rule != null,
-                    RtssBridge.IsInstalled, _tips, rule != null ? rule.Method : LimitMethods.Rtss);
+                    _tips, rule != null ? rule.Method : LimitMethods.Cpu);
                 card.Location = new Point(padX, y);
                 card.Width = cardW;
 
@@ -3440,25 +3187,8 @@ namespace GameMuteHelper
             r.Fps = LimitMethods.Clamp(newMethod, value);
             r.LimitFps = limitFps;
 
-            if (r.LimitFps && newMethod == LimitMethods.Rtss && !_rtssAvailable)
-            {
-                _rtssAvailable = RtssBridge.EnsureRunning();
-                if (!_rtssAvailable)
-                {
-                    r.LimitFps = false;
-                    SetFooterMessage("RTSS 启动失败，已关闭限帧；后台静音仍正常");
-                    RebuildCardList();
-                }
-            }
-
+            // 切换限帧方式或关闭限帧时，解除旧方式的干预
             if (methodChanged || !r.LimitFps) RestoreRuleLimits(procName);
-
-            if (r.LimitFps && newMethod == LimitMethods.Rtss)
-            {
-                string exe = procName + ".exe";
-                if (!_config.OriginalLimits.ContainsKey(exe))
-                    _config.OriginalLimits[exe] = RtssBridge.GetLimit(exe);
-            }
 
             SaveState();
             SetFooterMessage(string.Format("已更新 {0} 配置（{1}）", procName, LimitMethods.ShortLabel(r.Method)));
@@ -3624,8 +3354,6 @@ namespace GameMuteHelper
             try
             {
                 if (_showEvent.WaitOne(0)) ShowMainWindow();
-                _rtssUiTick++;
-                if ((_rtssUiTick % 4) == 0) UpdateRtssUi(); // 约每 2 秒同步一次 RTSS 状态
                 MonitorStep();
                 if (Visible)
                 {
@@ -3674,7 +3402,6 @@ namespace GameMuteHelper
             {
                 foreach (string name in _rules.Keys)
                 {
-                    RestoreAppLimit(name + ".exe");
                     _inactiveSince.Remove(name);
                     _liveState[name] = "未运行";
                 }
@@ -3712,12 +3439,10 @@ namespace GameMuteHelper
             {
                 string name = kv.Key;
                 AppRule rule = kv.Value;
-                string exe = name + ".exe";
 
                 List<int> pids;
                 if (!procsByName.TryGetValue(name, out pids))
                 {
-                    RestoreAppLimit(exe);
                     _inactiveSince.Remove(name);
                     _liveState[name] = "未运行";
                     continue;
@@ -3991,7 +3716,6 @@ namespace GameMuteHelper
                     }
                 }
 
-                uint appliedFps = 0;
                 int appliedCpu = 0;
                 int appliedSuspend = 0;
                 bool suspendFailed = false;
@@ -3999,8 +3723,7 @@ namespace GameMuteHelper
 
                 if (rule.LimitFps && method == LimitMethods.Cpu)
                 {
-                    // CPU 配额：不写 RTSS profile，按 PID 挂到独立 Job 上限制 CPU 时间
-                    RestoreAppLimit(exe);
+                    // CPU 配额：按 PID 挂到独立 Job 上限制 CPU 时间
                     StopSuspendForPids(pids);
                     int pct = LimitMethods.Clamp(LimitMethods.Cpu, rule.Fps);
                     if (shouldTrigger)
@@ -4033,10 +3756,9 @@ namespace GameMuteHelper
                 else if (rule.LimitFps && method == LimitMethods.Suspend)
                 {
                     // 挂起进程：周期性挂起/放行，实验性
-                    RestoreAppLimit(exe);
                     for (int i = 0; i < pids.Count; i++) RestoreQuotaForPid(pids[i]);
 
-                    int suspendFps = LimitMethods.Clamp(LimitMethods.Rtss, rule.Fps);
+                    int suspendFps = LimitMethods.Clamp(LimitMethods.Suspend, rule.Fps);
                     if (shouldTrigger)
                     {
                         int started = 0;
@@ -4066,7 +3788,7 @@ namespace GameMuteHelper
                             suspendFailed = true;
                             if (_suspendWarned.Add(name))
                             {
-                                SetFooterMessage(name + " 挂起失败：进程可能受反作弊保护，请改用 RTSS 或 CPU 配额");
+                                SetFooterMessage(name + " 挂起失败：进程可能受反作弊保护，请改用 CPU 配额");
                                 AppLogger.Log("Suspend unsupported for " + name, "WARN");
                             }
                         }
@@ -4076,38 +3798,9 @@ namespace GameMuteHelper
                         StopSuspendForPids(pids);
                     }
                 }
-                else if (rule.LimitFps && method == LimitMethods.Rtss && _rtssAvailable)
-                {
-                    for (int i = 0; i < pids.Count; i++) RestoreQuotaForPid(pids[i]);
-                    StopSuspendForPids(pids);
-
-                    if (shouldTrigger)
-                    {
-                        uint want = (uint)rule.Fps;
-                        uint cur;
-                        if (!_limitApplied.TryGetValue(exe, out cur) || cur != want)
-                        {
-                            if (!_config.OriginalLimits.ContainsKey(exe))
-                            {
-                                _config.OriginalLimits[exe] = RtssBridge.GetLimit(exe);
-                                SaveState();
-                            }
-                            if (RtssBridge.SetLimit(exe, want))
-                            {
-                                _limitApplied[exe] = want;
-                                SetFooterMessage(string.Format("{0} 切至后台 · 限帧 {1} FPS", name, want));
-                            }
-                        }
-                        _limitApplied.TryGetValue(exe, out appliedFps);
-                    }
-                    else
-                    {
-                        if (RestoreAppLimit(exe)) SetFooterMessage(name + " 切回前台 · 已恢复帧率");
-                    }
-                }
                 else
                 {
-                    RestoreAppLimit(exe);
+                    // 未开启限帧：解除所有方式的干预
                     for (int i = 0; i < pids.Count; i++) RestoreQuotaForPid(pids[i]);
                     StopSuspendForPids(pids);
                 }
@@ -4120,8 +3813,6 @@ namespace GameMuteHelper
                     _liveState[name] = string.Format("降音量{0}%·挂起{1}", attNowPct, appliedSuspend);
                 else if (attNowPct > 0 && appliedCpu > 0)
                     _liveState[name] = string.Format("降音量{0}%·CPU{1}%", attNowPct, appliedCpu);
-                else if (attNowPct > 0 && appliedFps > 0)
-                    _liveState[name] = string.Format("降音量{0}%·{1}FPS", attNowPct, appliedFps);
                 else if (attNowPct > 0)
                     _liveState[name] = string.Format("降音量{0}%", attNowPct);
                 else if (mutedNow && suspendFailed)
@@ -4130,8 +3821,6 @@ namespace GameMuteHelper
                     _liveState[name] = string.Format("静音·挂起{0}", appliedSuspend);
                 else if (mutedNow && appliedCpu > 0)
                     _liveState[name] = string.Format("静音·CPU{0}%", appliedCpu);
-                else if (mutedNow && appliedFps > 0)
-                    _liveState[name] = string.Format("静音·{0}FPS", appliedFps);
                 else if (mutedNow)
                     _liveState[name] = "已静音";
                 else if (suspendFailed)
@@ -4140,8 +3829,6 @@ namespace GameMuteHelper
                     _liveState[name] = string.Format("挂起 {0}", appliedSuspend);
                 else if (appliedCpu > 0)
                     _liveState[name] = string.Format("CPU {0}%", appliedCpu);
-                else if (appliedFps > 0)
-                    _liveState[name] = appliedFps + " FPS";
                 else
                     _liveState[name] = "后台";
             }
@@ -4400,10 +4087,6 @@ namespace GameMuteHelper
 
         private void RestoreAllLimits()
         {
-            foreach (string exe in _limitApplied.Keys.ToList())
-            {
-                RestoreAppLimit(exe);
-            }
             CpuQuotaCore.RestoreAll();
             SuspendCore.StopAll();
             _cpuApplied.Clear();
@@ -4412,7 +4095,6 @@ namespace GameMuteHelper
 
         private void RestoreRuleLimits(string procName)
         {
-            RestoreAppLimit(procName + ".exe");
             RestoreQuotaForProcess(procName);
             StopSuspendForProcess(procName);
             _suspendWarned.Remove(procName);
@@ -4457,33 +4139,6 @@ namespace GameMuteHelper
             catch { }
         }
 
-        private bool RestoreAppLimit(string exe)
-        {
-            if (!_limitApplied.ContainsKey(exe)) return false;
-            uint orig;
-            _config.OriginalLimits.TryGetValue(exe, out orig);
-            RtssBridge.SetLimit(exe, orig);
-            _limitApplied.Remove(exe);
-            return true;
-        }
-
-        private void RecoverFromCrash()
-        {
-            if (!_rtssAvailable) return;
-            foreach (AppRule r in _rules.Values)
-            {
-                if (!r.LimitFps) continue;
-                if (LimitMethods.Normalize(r.Method) != LimitMethods.Rtss) continue;
-                string exe = r.Name + ".exe";
-                uint orig;
-                if (_config.OriginalLimits.TryGetValue(exe, out orig) && RtssBridge.GetLimit(exe) == (uint)r.Fps)
-                {
-                    AppLogger.Log(string.Format("Crash recovery: restoring {0} FPS to {1}", exe, orig));
-                    RtssBridge.SetLimit(exe, orig);
-                }
-            }
-        }
-
         private void SetPaused(bool paused)
         {
             _paused = paused;
@@ -4501,119 +4156,9 @@ namespace GameMuteHelper
             UpdateHeaderAndTray();
         }
 
-        // ---------------------------------------------------------------------
-        // RTSS 自动启动 / 手动启动
-        // ---------------------------------------------------------------------
-        private void StartRtssAsync(bool notify)
-        {
-            if (!RtssBridge.IsInstalled) return;
-
-            if (RtssBridge.IsRunning)
-            {
-                _rtssAvailable = true;
-                UpdateRtssUi();
-                if (notify) SetFooterMessage("RTSS 已在运行 · 后台限帧可用");
-                return;
-            }
-
-            if (_rtssStartInFlight) return;
-            _rtssStartInFlight = true;
-
-            if (_startRtssBtn != null) _startRtssBtn.Enabled = false;
-            if (notify) SetFooterMessage("正在启动 RTSS...");
-
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                bool ok = RtssBridge.EnsureRunning();
-                AppLogger.Log(ok ? "RTSS started." : "RTSS start failed.", ok ? "INFO" : "WARN");
-                try
-                {
-                    if (!IsDisposed && IsHandleCreated)
-                    {
-                        BeginInvoke((Action)delegate
-                        {
-                            _rtssStartInFlight = false;
-                            _rtssAvailable = ok;
-                            if (_startRtssBtn != null) _startRtssBtn.Enabled = true;
-                            UpdateRtssUi();
-                            if (notify)
-                            {
-                                SetFooterMessage(ok
-                                    ? "RTSS 已启动 · 后台限帧可用"
-                                    : "RTSS 启动失败，请确认 RTSS 已正确安装");
-                            }
-                        });
-                    }
-                    else
-                    {
-                        _rtssAvailable = ok;
-                        _rtssStartInFlight = false;
-                    }
-                }
-                catch { _rtssStartInFlight = false; }
-            });
-        }
-
-        private bool AnyRuleUsesRtss()
-        {
-            if (_rules == null) return false;
-            foreach (AppRule r in _rules.Values)
-            {
-                if (r.LimitFps && LimitMethods.Normalize(r.Method) == LimitMethods.Rtss) return true;
-            }
-            return false;
-        }
-
-        private void UpdateRtssUi()
-        {
-            if (_rtssBadge == null || _startRtssBtn == null) return;
-
-            bool installed = RtssBridge.IsInstalled;
-            bool running = installed && RtssBridge.IsRunning;
-
-            string text;
-            Color color;
-            bool showStartBtn;
-
-            if (!installed)
-            {
-                text = "○ 未检测到 RTSS · 仅静音可用";
-                color = Theme.TextMuted;
-                showStartBtn = false;
-                _rtssAvailable = false;
-            }
-            else if (running)
-            {
-                text = "● RTSS 已就绪 · 支持后台限帧";
-                color = Theme.Green;
-                showStartBtn = false;
-                _rtssAvailable = true;
-            }
-            else
-            {
-                text = "○ RTSS 未运行 · 限帧不可用";
-                color = Theme.Amber;
-                showStartBtn = true;
-                _rtssAvailable = false;
-
-                // 掉线自动重启：仅在存在限帧规则、未暂停、且距上次尝试 ≥10s 时进行
-                if (!_paused && !_exiting && AnyRuleUsesRtss() && !_rtssStartInFlight
-                    && (DateTime.UtcNow - _lastRtssAutoRestart).TotalSeconds >= 10)
-                {
-                    _lastRtssAutoRestart = DateTime.UtcNow;
-                    SetFooterMessage("检测到 RTSS 已退出 · 正在自动重启...");
-                    StartRtssAsync(false);
-                }
-            }
-
-            if (_rtssBadge.Text != text) _rtssBadge.Text = text;
-            if (_rtssBadge.ForeColor != color) _rtssBadge.ForeColor = color;
-            if (_startRtssBtn.Visible != showStartBtn) _startRtssBtn.Visible = showStartBtn;
-        }
-
         private void UpdateHeaderAndTray()
         {
-            bool throttling = _audioByUs.Count > 0 || _limitApplied.Count > 0;
+            bool throttling = _audioByUs.Count > 0 || _cpuApplied.Count > 0 || SuspendCore.HasActiveWorkers();
             string key = string.Format("{0}|{1}|{2}", _paused, throttling, _rules.Count);
             if (key == _lastTrayKey) return;
             _lastTrayKey = key;
@@ -4657,7 +4202,7 @@ namespace GameMuteHelper
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
-            AppLogger.Log("Session ending; restoring audio and RTSS limits.");
+            AppLogger.Log("Session ending; restoring audio and CPU limits.");
             RestoreAudio(true);
             RestoreAllLimits();
         }
