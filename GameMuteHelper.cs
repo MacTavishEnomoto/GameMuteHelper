@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.5.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.5.1.0")]
+[assembly: System.Reflection.AssemblyVersion("3.6.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.6.0.0")]
 
 namespace GameMuteHelper
 {
@@ -86,10 +86,17 @@ namespace GameMuteHelper
                     try { AppLogger.Log("UI error: " + (te != null && te.Exception != null ? te.Exception.ToString() : "?"), "ERROR"); } catch { }
                     try { SuspendCore.StopAll(); } catch { }
                 };
+                // 进程正常退出（Environment.Exit 等）时也确保恢复，参考 GamePauser 的做法
+                AppDomain.CurrentDomain.ProcessExit += delegate
+                {
+                    try { SuspendCore.StopAll(); } catch { }
+                    try { CpuQuotaCore.RestoreAll(); } catch { }
+                };
 
+                bool debugPriv = ProcessPrivileges.EnableDebugPrivilege();
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.5.1 (Admin={0}, Background={1}, 64Bit={2})",
-                    IsAdministrator(), background, Environment.Is64BitProcess));
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.6 (Admin={0}, Background={1}, 64Bit={2}, SeDebug={3})",
+                    IsAdministrator(), background, Environment.Is64BitProcess, debugPriv));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
                 if (background)
@@ -114,6 +121,63 @@ namespace GameMuteHelper
                 }
             }
             catch { return false; }
+        }
+    }
+
+    // =========================================================================
+    // 进程特权（SeDebugPrivilege）— 参考 Process Governor / System Informer
+    // =========================================================================
+    internal static class ProcessPrivileges
+    {
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool LookupPrivilegeValue(string systemName, string name, out LUID luid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(IntPtr tokenHandle, bool disableAllPrivileges,
+            ref TOKEN_PRIVILEGES newState, uint bufferLength, IntPtr previousState, IntPtr returnLength);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID { public uint LowPart; public int HighPart; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID_AND_ATTRIBUTES Privileges; }
+
+        private const uint TokenAdjustPrivileges = 0x0020;
+        private const uint TokenQuery = 0x0008;
+        private const uint SePrivilegeEnabled = 0x0002;
+
+        public static bool EnableDebugPrivilege()
+        {
+            IntPtr token = IntPtr.Zero;
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TokenAdjustPrivileges | TokenQuery, out token)) return false;
+
+                LUID luid;
+                if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out luid)) return false;
+
+                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+                tp.PrivilegeCount = 1;
+                tp.Privileges.Luid = luid;
+                tp.Privileges.Attributes = SePrivilegeEnabled;
+
+                if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
+                return Marshal.GetLastWin32Error() == 0; // 1300 = ERROR_NOT_ALL_ASSIGNED
+            }
+            catch { return false; }
+            finally { if (token != IntPtr.Zero) CloseHandle(token); }
         }
     }
 
@@ -236,6 +300,7 @@ namespace GameMuteHelper
         [DataMember] public bool Mute { get; set; }
         [DataMember] public bool LimitFps { get; set; }
         [DataMember] public int Fps { get; set; }
+        [DataMember(EmitDefaultValue = false)] public bool? SuspendFallbackCpu { get; set; }
         [DataMember(EmitDefaultValue = false)] public string AudioMode { get; set; }
         [DataMember(EmitDefaultValue = false)] public int? AudioVolume { get; set; }
 
@@ -246,6 +311,7 @@ namespace GameMuteHelper
             Mute = true;
             LimitFps = false;
             Fps = 5;
+            SuspendFallbackCpu = true;
         }
     }
 
@@ -263,7 +329,7 @@ namespace GameMuteHelper
 
         public ConfigData()
         {
-            Version = "3.3";
+            Version = "3.6";
             DebounceMs = 500;
             FadeMs = 500;
             Apps = new List<AppRule>();
@@ -324,6 +390,9 @@ namespace GameMuteHelper
                     // 3.4：每应用音频模式（完全静音 / 降低音量），旧配置默认静音
                     r.AudioMode = AudioModes.Normalize(r.AudioMode);
                     r.AudioVolume = AudioModes.ClampVolume(r.AudioVolume.HasValue ? r.AudioVolume.Value : AudioModes.DefaultVolume);
+
+                    // 3.6：挂起失败时默认自动回退到 CPU 配额
+                    if (!r.SuspendFallbackCpu.HasValue) r.SuspendFallbackCpu = true;
                 }
             }
             catch (Exception ex)
@@ -337,7 +406,7 @@ namespace GameMuteHelper
         {
             try
             {
-                data.Version = "3.3";
+                data.Version = "3.6";
                 data.Watch = null;
                 data.TargetFps = null;
                 data.LimitFps = null;
@@ -957,6 +1026,7 @@ namespace GameMuteHelper
 
         private const uint ProcessSuspendResume = 0x0800;
         private const uint Synchronize = 0x00100000;
+        private const uint ProcessQueryLimitedInformation = 0x1000;
 
         private class Worker
         {
@@ -990,7 +1060,7 @@ namespace GameMuteHelper
                     StopUnlocked(pid);
                 }
 
-                IntPtr h = OpenProcess(ProcessSuspendResume | Synchronize, false, pid);
+                IntPtr h = OpenProcess(ProcessSuspendResume | Synchronize | ProcessQueryLimitedInformation, false, pid);
                 if (h == IntPtr.Zero)
                 {
                     int err = Marshal.GetLastWin32Error();
@@ -2076,25 +2146,28 @@ namespace GameMuteHelper
         private PillButton _audioBtn;
         private ContextMenuStrip _methodMenu;
         private ContextMenuStrip _audioMenu;
+        private ToolStripMenuItem _fallbackMenuItem;
         private string _method = LimitMethods.Cpu;
         private int _value = 5;
+        private bool _suspendFallbackCpu = true;
         private string _audioMode = AudioModes.Mute;
         private int _volumePercent = AudioModes.DefaultVolume;
 
-        public event Action<string, bool, bool, int, string> RuleChanged;
+        public event Action<string, bool, bool, int, string, bool> RuleChanged;
         public event Action<string, bool, string, int> AudioRuleChanged;
         public event Action<string> RemoveClicked;
         public event Action<string> AddClicked;
 
         public AppCardControl(string procName, string title, Image icon, bool isManagedView,
                               AppRule rule, bool alreadyManaged, ToolTip tips,
-                              string method)
+                              string method, bool suspendFallbackCpu)
         {
             ProcessName = procName;
             _windowTitle = title ?? "";
             _appIcon = icon;
             IsManagedView = isManagedView;
             _method = LimitMethods.Normalize(method);
+            _suspendFallbackCpu = suspendFallbackCpu;
             _statusText = "—";
             _statusFg = Theme.TextMuted;
             _statusBg = Theme.InputBg;
@@ -2311,7 +2384,7 @@ namespace GameMuteHelper
         {
             if (RuleChanged != null && _muteToggle != null && _fpsToggle != null)
             {
-                RuleChanged(ProcessName, _muteToggle.Checked, _fpsToggle.Checked, ParseValue(), _method);
+                RuleChanged(ProcessName, _muteToggle.Checked, _fpsToggle.Checked, ParseValue(), _method, _suspendFallbackCpu);
             }
             if (AudioRuleChanged != null && _muteToggle != null)
             {
@@ -2337,7 +2410,18 @@ namespace GameMuteHelper
                 ToolStripMenuItem suspend = new ToolStripMenuItem("挂起进程（实验性，可能卡顿/声音异常）");
                 suspend.Click += (s, e) => ChangeMethod(LimitMethods.Suspend);
                 _methodMenu.Items.Add(suspend);
+
+                _methodMenu.Items.Add(new ToolStripSeparator());
+                _fallbackMenuItem = new ToolStripMenuItem("挂起失败时自动改用 CPU 配额");
+                _fallbackMenuItem.Click += (s, e) =>
+                {
+                    _suspendFallbackCpu = !_suspendFallbackCpu;
+                    _fallbackMenuItem.Checked = _suspendFallbackCpu;
+                    NotifyRuleChanged();
+                };
+                _methodMenu.Items.Add(_fallbackMenuItem);
             }
+            if (_fallbackMenuItem != null) _fallbackMenuItem.Checked = _suspendFallbackCpu;
             _methodMenu.Show(_methodBtn, new Point(0, _methodBtn.Height));
         }
 
@@ -2630,6 +2714,7 @@ namespace GameMuteHelper
         private Dictionary<string, AudioTrack> _audioByUs;
         private Dictionary<int, int> _cpuApplied;
         private HashSet<string> _suspendWarned;
+        private HashSet<string> _fallbackFromSuspend;
         private Dictionary<string, DateTime> _inactiveSince;
         private Dictionary<string, string> _liveState;
         private Dictionary<string, Image> _iconCache;
@@ -2679,6 +2764,7 @@ namespace GameMuteHelper
             _lastGoodOriginal = new Dictionary<string, OriginalSnapshot>(StringComparer.OrdinalIgnoreCase);
             _cpuApplied = new Dictionary<int, int>();
             _suspendWarned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _fallbackFromSuspend = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _inactiveSince = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
             _liveState = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             _iconCache = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
@@ -3205,7 +3291,8 @@ namespace GameMuteHelper
                 lock (_iconCacheSync) { if (_iconCache.ContainsKey(name)) icon = _iconCache[name]; }
                 AppRule rule = _rules.ContainsKey(name) ? _rules[name] : null;
                 AppCardControl card = new AppCardControl(name, title, icon, managedTab, rule, rule != null,
-                    _tips, rule != null ? rule.Method : LimitMethods.Cpu);
+                    _tips, rule != null ? rule.Method : LimitMethods.Cpu,
+                    rule == null || !rule.SuspendFallbackCpu.HasValue || rule.SuspendFallbackCpu.Value);
                 card.Location = new Point(padX, y);
                 card.Width = cardW;
 
@@ -3307,7 +3394,7 @@ namespace GameMuteHelper
                     : (_runningTitles.ContainsKey(card.ProcessName) ? "运行中" : "未运行");
             }
 
-            if (st.Contains("静音") || st.Contains("FPS") || st.Contains("CPU") || st.Contains("挂起") || st.Contains("降音量"))
+            if (st.Contains("静音") || st.Contains("FPS") || st.Contains("CPU") || st.Contains("挂起") || st.Contains("降音量") || st.Contains("回退"))
                 card.SetStatus(st, Theme.Amber, Theme.AmberSoft);
             else if (st == "前台" || st == "运行中")
                 card.SetStatus(st, Theme.Green, Theme.GreenSoft);
@@ -3315,7 +3402,7 @@ namespace GameMuteHelper
                 card.SetStatus(st, Theme.TextMuted, Theme.InputBg);
         }
 
-        private void OnRuleChanged(string procName, bool mute, bool limitFps, int value, string method)
+        private void OnRuleChanged(string procName, bool mute, bool limitFps, int value, string method, bool suspendFallbackCpu)
         {
             if (!_rules.ContainsKey(procName)) return;
             AppRule r = _rules[procName];
@@ -3326,12 +3413,19 @@ namespace GameMuteHelper
             r.Method = newMethod;
             r.Fps = LimitMethods.Clamp(newMethod, value);
             r.LimitFps = limitFps;
+            bool oldFallback = !r.SuspendFallbackCpu.HasValue || r.SuspendFallbackCpu.Value;
+            bool fallbackChanged = oldFallback != suspendFallbackCpu;
+            r.SuspendFallbackCpu = suspendFallbackCpu;
+
+            // 只有方式/回退设置变化才重置临时回退；改音量等无关操作不应重新触发挂起失败
+            if (methodChanged || fallbackChanged) _fallbackFromSuspend.Remove(procName);
 
             // 切换限帧方式或关闭限帧时，解除旧方式的干预
             if (methodChanged || !r.LimitFps) RestoreRuleLimits(procName);
 
             SaveState();
-            SetFooterMessage(string.Format("已更新 {0} 配置（{1}）", procName, LimitMethods.ShortLabel(r.Method)));
+            SetFooterMessage(string.Format("已更新 {0} 配置（{1}{2}）", procName, LimitMethods.ShortLabel(r.Method),
+                newMethod == LimitMethods.Suspend ? (suspendFallbackCpu ? " · 失败回退CPU" : " · 不回退") : ""));
         }
 
         private void OnAudioRuleChanged(string procName, bool audioOn, string audioMode, int volumePercent)
@@ -3872,7 +3966,15 @@ namespace GameMuteHelper
                 int appliedCpu = 0;
                 int appliedSuspend = 0;
                 bool suspendFailed = false;
+                bool fallbackActive = false;
                 string method = LimitMethods.Normalize(rule.Method);
+                if (rule.LimitFps && method == LimitMethods.Suspend && _fallbackFromSuspend.Contains(name))
+                {
+                    // 本会话内挂起被拒，按设置自动改用 CPU 配额
+                    fallbackActive = true;
+                    method = LimitMethods.Cpu;
+                }
+                string cpuTag = fallbackActive ? "回退CPU" : "CPU";
 
                 if (rule.LimitFps && method == LimitMethods.Cpu)
                 {
@@ -3899,7 +4001,12 @@ namespace GameMuteHelper
                             }
                         }
                         if (anyApplied) appliedCpu = pct;
-                        if (changed) SetFooterMessage(string.Format("{0} 切至后台 · CPU 配额 {1}%", name, pct));
+                        if (changed)
+                        {
+                            SetFooterMessage(fallbackActive
+                                ? string.Format("{0} 挂起被拒 · 已回退 CPU 配额 {1}%", name, pct)
+                                : string.Format("{0} 切至后台 · CPU 配额 {1}%", name, pct));
+                        }
                     }
                     else
                     {
@@ -3931,6 +4038,7 @@ namespace GameMuteHelper
                             if (SuspendCore.HasFailed(pids[i])) anyFailed = true;
                         }
 
+                        bool fallbackCpu = !rule.SuspendFallbackCpu.HasValue || rule.SuspendFallbackCpu.Value;
                         if (started > 0 && !anyFailed)
                         {
                             appliedSuspend = suspendFps;
@@ -3939,10 +4047,17 @@ namespace GameMuteHelper
                         else
                         {
                             suspendFailed = true;
-                            if (_suspendWarned.Add(name))
+                            if (fallbackCpu)
                             {
-                                SetFooterMessage(name + " 挂起失败：进程可能受反作弊保护，请改用 CPU 配额");
-                                AppLogger.Log("Suspend unsupported for " + name, "WARN");
+                                _fallbackFromSuspend.Add(name);
+                                StopSuspendForPids(pids);
+                                SetFooterMessage(name + " 挂起失败：进程受保护，已自动改用 CPU 配额");
+                                AppLogger.Log("Suspend fallback to CPU for " + name, "WARN");
+                            }
+                            else if (_suspendWarned.Add(name))
+                            {
+                                SetFooterMessage(name + " 挂起失败：进程可能受反作弊保护（自动回退已关闭）");
+                                AppLogger.Log("Suspend unsupported for " + name + " (fallback disabled)", "WARN");
                             }
                         }
                     }
@@ -3965,7 +4080,7 @@ namespace GameMuteHelper
                 else if (attNowPct > 0 && appliedSuspend > 0)
                     _liveState[name] = string.Format("降音量{0}%·挂起{1}", attNowPct, appliedSuspend);
                 else if (attNowPct > 0 && appliedCpu > 0)
-                    _liveState[name] = string.Format("降音量{0}%·CPU{1}%", attNowPct, appliedCpu);
+                    _liveState[name] = string.Format("降音量{0}%·{1}{2}%", attNowPct, cpuTag, appliedCpu);
                 else if (attNowPct > 0)
                     _liveState[name] = string.Format("降音量{0}%", attNowPct);
                 else if (mutedNow && suspendFailed)
@@ -3973,15 +4088,17 @@ namespace GameMuteHelper
                 else if (mutedNow && appliedSuspend > 0)
                     _liveState[name] = string.Format("静音·挂起{0}", appliedSuspend);
                 else if (mutedNow && appliedCpu > 0)
-                    _liveState[name] = string.Format("静音·CPU{0}%", appliedCpu);
+                    _liveState[name] = string.Format("静音·{0}{1}%", cpuTag, appliedCpu);
                 else if (mutedNow)
                     _liveState[name] = "已静音";
                 else if (suspendFailed)
                     _liveState[name] = "挂起失败";
+                else if (fallbackActive && appliedCpu == 0)
+                    _liveState[name] = "回退失败";
                 else if (appliedSuspend > 0)
                     _liveState[name] = string.Format("挂起 {0}", appliedSuspend);
                 else if (appliedCpu > 0)
-                    _liveState[name] = string.Format("CPU {0}%", appliedCpu);
+                    _liveState[name] = string.Format("{0} {1}%", cpuTag, appliedCpu);
                 else
                     _liveState[name] = "后台";
             }
@@ -4244,6 +4361,7 @@ namespace GameMuteHelper
             SuspendCore.StopAll();
             _cpuApplied.Clear();
             _suspendWarned.Clear();
+            _fallbackFromSuspend.Clear();
         }
 
         private void RestoreRuleLimits(string procName)
@@ -4251,6 +4369,7 @@ namespace GameMuteHelper
             RestoreQuotaForProcess(procName);
             StopSuspendForProcess(procName);
             _suspendWarned.Remove(procName);
+            _fallbackFromSuspend.Remove(procName);
         }
 
         private void StopSuspendForPids(List<int> pids)
