@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.5.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.5.0.0")]
+[assembly: System.Reflection.AssemblyVersion("3.5.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.5.1.0")]
 
 namespace GameMuteHelper
 {
@@ -88,7 +88,7 @@ namespace GameMuteHelper
                 };
 
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.5.0 (Admin={0}, Background={1}, 64Bit={2})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.5.1 (Admin={0}, Background={1}, 64Bit={2})",
                     IsAdministrator(), background, Environment.Is64BitProcess));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -669,6 +669,146 @@ namespace GameMuteHelper
         }
     }
 
+    // =========================================================================
+    // 进程亲缘判定：模拟器/游戏的主窗口进程与音频进程常是两个不同进程
+    // （如 MuMuPlayer 持窗口、MuMuNxDevice 出声音）。前台判定若只比对
+    // PID，点窗口时永远判定「在后台」，降音量就永远不恢复。
+    // 这里通过父进程链与可执行文件目录判定「是否同一应用家族」。
+    // =========================================================================
+    internal static class ProcessKinship
+    {
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(IntPtr hProcess, int pic,
+            ref ProcessBasicInformation pbi, int cb, out int pSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr h);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessBasicInformation
+        {
+            public IntPtr Reserved1;
+            public IntPtr PebBaseAddress;
+            public IntPtr Reserved2a;
+            public IntPtr Reserved2b;
+            public IntPtr UniquePid;
+            public IntPtr InheritedFromUniquePid; // PPID
+        }
+
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+
+        // 进程名 → 主模块路径缓存（避免每 tick 重复取路径）
+        private static readonly Dictionary<int, string> ExePathByPid = new Dictionary<int, string>();
+        private static DateTime _cacheClearedUtc = DateTime.UtcNow;
+
+        public static int GetParentPid(int pid)
+        {
+            if (pid <= 0) return 0;
+            IntPtr h = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+            if (h == IntPtr.Zero) return 0;
+            try
+            {
+                ProcessBasicInformation pbi = new ProcessBasicInformation();
+                int size;
+                if (NtQueryInformationProcess(h, 0, ref pbi, Marshal.SizeOf(typeof(ProcessBasicInformation)), out size) == 0)
+                {
+                    return (int)pbi.InheritedFromUniquePid;
+                }
+            }
+            catch { }
+            finally { CloseHandle(h); }
+            return 0;
+        }
+
+        public static string GetExePath(int pid)
+        {
+            if (pid <= 0) return "";
+            // 缓存 30 秒整体重建一次：进程路径不变，重复查询纯浪费
+            if ((DateTime.UtcNow - _cacheClearedUtc).TotalSeconds > 30)
+            {
+                ExePathByPid.Clear();
+                _cacheClearedUtc = DateTime.UtcNow;
+            }
+            string cached;
+            if (ExePathByPid.TryGetValue(pid, out cached)) return cached;
+            string path = "";
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                {
+                    path = p.MainModule != null ? p.MainModule.FileName ?? "" : "";
+                }
+            }
+            catch { }
+            ExePathByPid[pid] = path;
+            return path;
+        }
+
+        // 判定窗口进程(fgPid)与接管进程(pid)是否属于同一应用：
+        // 同进程 / 同可执行文件 / 同安装目录 / 父链上互见（最多 4 级）
+        public static bool SameApp(int fgPid, int pid)
+        {
+            if (fgPid <= 0 || pid <= 0) return false;
+            if (fgPid == pid) return true;
+
+            string fgPath = GetExePath(fgPid);
+            string myPath = GetExePath(pid);
+            if (fgPath.Length > 0 && myPath.Length > 0)
+            {
+                if (string.Equals(fgPath, myPath, StringComparison.OrdinalIgnoreCase)) return true;
+                string fgDir = Path.GetDirectoryName(fgPath) ?? "";
+                string myDir = Path.GetDirectoryName(myPath) ?? "";
+                // MuMuPlayer\shell 与 MuMuPlayer\nx_main 同属一个安装根
+                string fgRoot = RootOf(fgDir);
+                string myRoot = RootOf(myDir);
+                if (fgRoot.Length > 0 && string.Equals(fgRoot, myRoot, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+
+            // 父进程链互见：fg 的祖先里有 pid，或反过来
+            if (OnAncestry(fgPid, pid) || OnAncestry(pid, fgPid)) return true;
+            return false;
+        }
+
+        private static bool OnAncestry(int childPid, int ancestorPid)
+        {
+            int cur = childPid;
+            for (int i = 0; i < 4 && cur > 0; i++)
+            {
+                cur = GetParentPid(cur);
+                if (cur == ancestorPid) return true;
+            }
+            return false;
+        }
+
+        // 取安装根目录：向上最多两级，忽略常见子目录名
+        private static string RootOf(string dir)
+        {
+            if (dir.Length == 0) return "";
+            string d = dir.TrimEnd('\\', '/');
+            for (int i = 0; i < 2; i++)
+            {
+                string parent = Path.GetDirectoryName(d);
+                if (string.IsNullOrEmpty(parent)) break;
+                string leaf = Path.GetFileName(d);
+                // 子目录名是常见结构词时继续上溯
+                if (leaf.Equals("shell", StringComparison.OrdinalIgnoreCase)
+                    || leaf.Equals("nx_main", StringComparison.OrdinalIgnoreCase)
+                    || leaf.Equals("nx_device", StringComparison.OrdinalIgnoreCase)
+                    || leaf.Equals("bin", StringComparison.OrdinalIgnoreCase)
+                    || leaf.Equals("win", StringComparison.OrdinalIgnoreCase)
+                    || leaf.Equals("x64", StringComparison.OrdinalIgnoreCase)
+                    || leaf.Equals("bin64", StringComparison.OrdinalIgnoreCase))
+                {
+                    d = parent;
+                }
+                else break;
+            }
+            return d;
+        }
+    }
 
     // =========================================================================
     // CPU 配额限速（Job Object）— 只限制 CPU 时间占比，不直接控制帧率
@@ -3448,7 +3588,20 @@ namespace GameMuteHelper
                     continue;
                 }
 
-                bool active = pids.Contains(fgPid);
+                // 前台判定：窗口进程与接管进程可能是两个不同进程
+                //（MuMuPlayer 持窗口、MuMuNxDevice 出声音），用亲缘判定
+                bool active = false;
+                if (fgPid > 0)
+                {
+                    for (int i = 0; i < pids.Count; i++)
+                    {
+                        if (pids[i] == fgPid || ProcessKinship.SameApp(fgPid, pids[i]))
+                        {
+                            active = true;
+                            break;
+                        }
+                    }
+                }
                 bool shouldTrigger;
                 if (active)
                 {
