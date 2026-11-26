@@ -189,35 +189,42 @@ namespace GameMuteHelper
         public static string DataDir { get; private set; }
         public static string ConfigPath { get; private set; }
         public static string LogPath { get; private set; }
+        private static readonly object LogSync = new object();
 
         public static void Init()
         {
-            DataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GameMuteHelper");
-            if (!Directory.Exists(DataDir)) Directory.CreateDirectory(DataDir);
-            ConfigPath = Path.Combine(DataDir, "config.json");
-            LogPath = Path.Combine(DataDir, "app.log");
+            lock (LogSync)
+            {
+                DataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GameMuteHelper");
+                if (!Directory.Exists(DataDir)) Directory.CreateDirectory(DataDir);
+                ConfigPath = Path.Combine(DataDir, "config.json");
+                LogPath = Path.Combine(DataDir, "app.log");
+            }
         }
 
         public static void Log(string msg, string level)
         {
-            try
+            lock (LogSync)
             {
-                if (string.IsNullOrEmpty(LogPath)) Init();
-                if (File.Exists(LogPath))
+                try
                 {
-                    FileInfo fi = new FileInfo(LogPath);
-                    if (fi.Length > 524288)
+                    if (string.IsNullOrEmpty(LogPath)) Init();
+                    if (File.Exists(LogPath))
                     {
-                        string bak = LogPath + ".old";
-                        if (File.Exists(bak)) File.Delete(bak);
-                        File.Move(LogPath, bak);
+                        FileInfo fi = new FileInfo(LogPath);
+                        if (fi.Length > 524288)
+                        {
+                            string bak = LogPath + ".old";
+                            if (File.Exists(bak)) File.Delete(bak);
+                            File.Move(LogPath, bak);
+                        }
                     }
+                    string line = string.Format("[{0}] [{1}] {2}{3}",
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), level, msg, Environment.NewLine);
+                    File.AppendAllText(LogPath, line, Encoding.UTF8);
                 }
-                string line = string.Format("[{0}] [{1}] {2}{3}",
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), level, msg, Environment.NewLine);
-                File.AppendAllText(LogPath, line, Encoding.UTF8);
+                catch { }
             }
-            catch { }
         }
 
         public static void Log(string msg) { Log(msg, "INFO"); }
@@ -312,6 +319,8 @@ namespace GameMuteHelper
             LimitFps = false;
             Fps = 5;
             SuspendFallbackCpu = true;
+            AudioMode = AudioModes.Mute;
+            AudioVolume = AudioModes.DefaultVolume;
         }
     }
 
@@ -417,7 +426,25 @@ namespace GameMuteHelper
                 using (MemoryStream ms = new MemoryStream())
                 {
                     ser.WriteObject(ms, data);
-                    File.WriteAllBytes(AppLogger.ConfigPath, ms.ToArray());
+                    byte[] bytes = ms.ToArray();
+                    string tmpPath = AppLogger.ConfigPath + ".tmp";
+                    File.WriteAllBytes(tmpPath, bytes);
+                    if (File.Exists(AppLogger.ConfigPath))
+                    {
+                        try
+                        {
+                            File.Replace(tmpPath, AppLogger.ConfigPath, null);
+                        }
+                        catch
+                        {
+                            File.Copy(tmpPath, AppLogger.ConfigPath, true);
+                            try { File.Delete(tmpPath); } catch { }
+                        }
+                    }
+                    else
+                    {
+                        File.Move(tmpPath, AppLogger.ConfigPath);
+                    }
                 }
             }
             catch (Exception ex)
@@ -486,11 +513,18 @@ namespace GameMuteHelper
         [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
         private interface IMMDeviceEnumerator
         {
-            [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+            [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
             [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
             [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
             [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
             [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr client);
+        }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E")]
+        private interface IMMDeviceCollection
+        {
+            [PreserveSig] int GetCount(out uint count);
+            [PreserveSig] int Item(uint index, out IMMDevice device);
         }
 
         [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("D666063F-1587-4E43-81F1-B948E807363F")]
@@ -597,24 +631,18 @@ namespace GameMuteHelper
             }
         }
 
-        public static List<AudioSessionInfo> GetSessions()
+        private static void CollectDeviceSessions(IMMDevice device, List<AudioSessionInfo> result)
         {
-            List<AudioSessionInfo> result = new List<AudioSessionInfo>();
-            IMMDeviceEnumerator enumerator = null;
-            IMMDevice device = null;
             IAudioSessionManager2 mgr = null;
             IAudioSessionEnumerator se = null;
-
             try
             {
-                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
-                if (enumerator.GetDefaultAudioEndpoint(0, 1, out device) != 0 || device == null) return result;
                 object obj;
                 Guid iid = typeof(IAudioSessionManager2).GUID;
-                if (device.Activate(ref iid, 0x17, IntPtr.Zero, out obj) != 0 || obj == null) return result;
+                if (device.Activate(ref iid, 0x17, IntPtr.Zero, out obj) != 0 || obj == null) return;
                 mgr = obj as IAudioSessionManager2;
-                if (mgr == null) return result;
-                if (mgr.GetSessionEnumerator(out se) != 0 || se == null) return result;
+                if (mgr == null) return;
+                if (mgr.GetSessionEnumerator(out se) != 0 || se == null) return;
 
                 int count;
                 se.GetCount(out count);
@@ -624,6 +652,8 @@ namespace GameMuteHelper
                     try
                     {
                         if (se.GetSession(i, out ctl) != 0 || ctl == null) continue;
+                        int state;
+                        if (ctl.GetState(out state) == 0 && state == 2) continue; // 跳过 AudioSessionStateExpired
                         IAudioSessionControl2 c2 = ctl as IAudioSessionControl2;
                         uint pid = 0;
                         string inst = "";
@@ -659,7 +689,51 @@ namespace GameMuteHelper
             {
                 SafeRelease(se);
                 SafeRelease(mgr);
-                SafeRelease(device);
+            }
+        }
+
+        public static List<AudioSessionInfo> GetSessions()
+        {
+            List<AudioSessionInfo> result = new List<AudioSessionInfo>();
+            IMMDeviceEnumerator enumerator = null;
+            IMMDeviceCollection collection = null;
+
+            try
+            {
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+                // 枚举所有活跃播放端点（兼容多设备/游戏单独指定耳机输出）
+                if (enumerator.EnumAudioEndpoints(0, 1, out collection) == 0 && collection != null)
+                {
+                    uint devCount;
+                    if (collection.GetCount(out devCount) == 0 && devCount > 0)
+                    {
+                        for (uint d = 0; d < devCount; d++)
+                        {
+                            IMMDevice device = null;
+                            try
+                            {
+                                if (collection.Item(d, out device) == 0 && device != null)
+                                    CollectDeviceSessions(device, result);
+                            }
+                            finally { SafeRelease(device); }
+                        }
+                        return result;
+                    }
+                }
+
+                // 回退到默认多媒体播放设备
+                IMMDevice defDevice = null;
+                try
+                {
+                    if (enumerator.GetDefaultAudioEndpoint(0, 1, out defDevice) == 0 && defDevice != null)
+                        CollectDeviceSessions(defDevice, result);
+                }
+                finally { SafeRelease(defDevice); }
+            }
+            catch { }
+            finally
+            {
+                SafeRelease(collection);
                 SafeRelease(enumerator);
             }
             return result;
@@ -683,19 +757,13 @@ namespace GameMuteHelper
             });
         }
 
-        // 按 InstanceId 找到会话并对 ISimpleAudioVolume 执行操作
-        private static bool ApplyToSession(string instanceId, Func<ISimpleAudioVolume, bool> action)
+        private static bool ApplyToDeviceSession(IMMDevice device, string instanceId, Func<ISimpleAudioVolume, bool> action, out bool found)
         {
-            if (string.IsNullOrEmpty(instanceId)) return false;
-            IMMDeviceEnumerator enumerator = null;
-            IMMDevice device = null;
+            found = false;
             IAudioSessionManager2 mgr = null;
             IAudioSessionEnumerator se = null;
-
             try
             {
-                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
-                if (enumerator.GetDefaultAudioEndpoint(0, 1, out device) != 0 || device == null) return false;
                 object obj;
                 Guid iid = typeof(IAudioSessionManager2).GUID;
                 if (device.Activate(ref iid, 0x17, IntPtr.Zero, out obj) != 0 || obj == null) return false;
@@ -716,6 +784,7 @@ namespace GameMuteHelper
                         string inst;
                         c2.GetSessionInstanceIdentifier(out inst);
                         if (inst != instanceId) continue;
+                        found = true;
                         ISimpleAudioVolume vol = ctl as ISimpleAudioVolume;
                         if (vol == null) return false;
                         return action(vol);
@@ -731,7 +800,56 @@ namespace GameMuteHelper
             {
                 SafeRelease(se);
                 SafeRelease(mgr);
-                SafeRelease(device);
+            }
+            return false;
+        }
+
+        // 按 InstanceId 在所有活跃播放端点中找到会话并对 ISimpleAudioVolume 执行操作
+        private static bool ApplyToSession(string instanceId, Func<ISimpleAudioVolume, bool> action)
+        {
+            if (string.IsNullOrEmpty(instanceId)) return false;
+            IMMDeviceEnumerator enumerator = null;
+            IMMDeviceCollection collection = null;
+
+            try
+            {
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+                if (enumerator.EnumAudioEndpoints(0, 1, out collection) == 0 && collection != null)
+                {
+                    uint devCount;
+                    if (collection.GetCount(out devCount) == 0 && devCount > 0)
+                    {
+                        for (uint d = 0; d < devCount; d++)
+                        {
+                            IMMDevice device = null;
+                            try
+                            {
+                                if (collection.Item(d, out device) != 0 || device == null) continue;
+                                bool found;
+                                bool ok = ApplyToDeviceSession(device, instanceId, action, out found);
+                                if (found) return ok;
+                            }
+                            finally { SafeRelease(device); }
+                        }
+                        return false;
+                    }
+                }
+
+                IMMDevice defDevice = null;
+                try
+                {
+                    if (enumerator.GetDefaultAudioEndpoint(0, 1, out defDevice) == 0 && defDevice != null)
+                    {
+                        bool found;
+                        return ApplyToDeviceSession(defDevice, instanceId, action, out found);
+                    }
+                }
+                finally { SafeRelease(defDevice); }
+            }
+            catch { return false; }
+            finally
+            {
+                SafeRelease(collection);
                 SafeRelease(enumerator);
             }
             return false;
@@ -756,6 +874,9 @@ namespace GameMuteHelper
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr h);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(IntPtr hProcess, int flags, StringBuilder exeName, ref int size);
+
         [StructLayout(LayoutKind.Sequential)]
         private struct ProcessBasicInformation
         {
@@ -769,55 +890,100 @@ namespace GameMuteHelper
 
         private const uint ProcessQueryLimitedInformation = 0x1000;
 
-        // 进程名 → 主模块路径缓存（避免每 tick 重复取路径）
+        // 进程 PID → 路径与父 PID 缓存（避免每 tick 重复查询）
         private static readonly Dictionary<int, string> ExePathByPid = new Dictionary<int, string>();
+        private static readonly Dictionary<int, int> ParentByPid = new Dictionary<int, int>();
         private static DateTime _cacheClearedUtc = DateTime.UtcNow;
+
+        private static void EnsureCacheFresh()
+        {
+            if ((DateTime.UtcNow - _cacheClearedUtc).TotalSeconds > 30)
+            {
+                ExePathByPid.Clear();
+                ParentByPid.Clear();
+                _cacheClearedUtc = DateTime.UtcNow;
+            }
+        }
 
         public static int GetParentPid(int pid)
         {
             if (pid <= 0) return 0;
+            EnsureCacheFresh();
+            int cached;
+            if (ParentByPid.TryGetValue(pid, out cached)) return cached;
+
+            int ppid = 0;
             IntPtr h = OpenProcess(ProcessQueryLimitedInformation, false, pid);
-            if (h == IntPtr.Zero) return 0;
-            try
+            if (h != IntPtr.Zero)
             {
-                ProcessBasicInformation pbi = new ProcessBasicInformation();
-                int size;
-                if (NtQueryInformationProcess(h, 0, ref pbi, Marshal.SizeOf(typeof(ProcessBasicInformation)), out size) == 0)
+                try
                 {
-                    return (int)pbi.InheritedFromUniquePid;
+                    ProcessBasicInformation pbi = new ProcessBasicInformation();
+                    int size;
+                    if (NtQueryInformationProcess(h, 0, ref pbi, Marshal.SizeOf(typeof(ProcessBasicInformation)), out size) == 0)
+                    {
+                        ppid = (int)pbi.InheritedFromUniquePid;
+                    }
                 }
+                catch { }
+                finally { CloseHandle(h); }
             }
-            catch { }
-            finally { CloseHandle(h); }
-            return 0;
+            ParentByPid[pid] = ppid;
+            return ppid;
         }
 
         public static string GetExePath(int pid)
         {
             if (pid <= 0) return "";
-            // 缓存 30 秒整体重建一次：进程路径不变，重复查询纯浪费
-            if ((DateTime.UtcNow - _cacheClearedUtc).TotalSeconds > 30)
-            {
-                ExePathByPid.Clear();
-                _cacheClearedUtc = DateTime.UtcNow;
-            }
+            EnsureCacheFresh();
             string cached;
             if (ExePathByPid.TryGetValue(pid, out cached)) return cached;
             string path = "";
-            try
+            IntPtr h = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+            if (h != IntPtr.Zero)
             {
-                using (Process p = Process.GetProcessById(pid))
+                try
                 {
-                    path = p.MainModule != null ? p.MainModule.FileName ?? "" : "";
+                    StringBuilder sb = new StringBuilder(1024);
+                    int len = sb.Capacity;
+                    if (QueryFullProcessImageName(h, 0, sb, ref len))
+                        path = sb.ToString();
                 }
+                catch { }
+                finally { CloseHandle(h); }
             }
-            catch { }
             ExePathByPid[pid] = path;
             return path;
         }
 
+        private static bool IsSharedSystemOrRootDir(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return true;
+            string d = dir.TrimEnd('\\', '/');
+            // 磁盘根目录如 C: / D:
+            if (d.Length <= 2 && d.EndsWith(":")) return true;
+            string winDir = (Environment.GetFolderPath(Environment.SpecialFolder.Windows) ?? "").TrimEnd('\\', '/');
+            if (winDir.Length > 0 &&
+                (d.Equals(winDir, StringComparison.OrdinalIgnoreCase)
+                 || d.Equals(Path.Combine(winDir, "System32"), StringComparison.OrdinalIgnoreCase)
+                 || d.Equals(Path.Combine(winDir, "SysWOW64"), StringComparison.OrdinalIgnoreCase)))
+                return true;
+
+            string pf = (Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) ?? "").TrimEnd('\\', '/');
+            string pf86 = (Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) ?? "").TrimEnd('\\', '/');
+            string desktop = (Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory) ?? "").TrimEnd('\\', '/');
+            string localApp = (Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) ?? "").TrimEnd('\\', '/');
+            if ((pf.Length > 0 && d.Equals(pf, StringComparison.OrdinalIgnoreCase))
+                || (pf86.Length > 0 && d.Equals(pf86, StringComparison.OrdinalIgnoreCase))
+                || (desktop.Length > 0 && d.Equals(desktop, StringComparison.OrdinalIgnoreCase))
+                || (localApp.Length > 0 && d.Equals(localApp, StringComparison.OrdinalIgnoreCase)))
+                return true;
+
+            return false;
+        }
+
         // 判定窗口进程(fgPid)与接管进程(pid)是否属于同一应用：
-        // 同进程 / 同可执行文件 / 同安装目录 / 父链上互见（最多 4 级）
+        // 同进程 / 同可执行文件 / 同独立安装目录 / 父链上互见（最多 4 级）
         public static bool SameApp(int fgPid, int pid)
         {
             if (fgPid <= 0 || pid <= 0) return false;
@@ -830,10 +996,13 @@ namespace GameMuteHelper
                 if (string.Equals(fgPath, myPath, StringComparison.OrdinalIgnoreCase)) return true;
                 string fgDir = Path.GetDirectoryName(fgPath) ?? "";
                 string myDir = Path.GetDirectoryName(myPath) ?? "";
-                // MuMuPlayer\shell 与 MuMuPlayer\nx_main 同属一个安装根
+                // MuMuPlayer\shell 与 MuMuPlayer\nx_main 同属一个安装根；
+                // 但排除 System32 / Program Files / Desktop 等公共目录，避免无关程序误判同应用
                 string fgRoot = RootOf(fgDir);
                 string myRoot = RootOf(myDir);
-                if (fgRoot.Length > 0 && string.Equals(fgRoot, myRoot, StringComparison.OrdinalIgnoreCase)) return true;
+                if (fgRoot.Length > 0 && !IsSharedSystemOrRootDir(fgRoot)
+                    && string.Equals(fgRoot, myRoot, StringComparison.OrdinalIgnoreCase))
+                    return true;
             }
 
             // 父进程链互见：fg 的祖先里有 pid，或反过来
@@ -914,6 +1083,7 @@ namespace GameMuteHelper
 
         // PID → Job 句柄。每个进程一个 Job，才能单独解除限制。
         private static readonly Dictionary<int, IntPtr> Jobs = new Dictionary<int, IntPtr>();
+        private static readonly object Sync = new object();
 
         public static bool SetRate(int pid, int percent)
         {
@@ -921,32 +1091,41 @@ namespace GameMuteHelper
             if (percent < 1) percent = 1;
             if (percent > 100) percent = 100;
 
-            IntPtr job;
-            if (!Jobs.TryGetValue(pid, out job) || job == IntPtr.Zero)
+            lock (Sync)
             {
-                job = CreateJobObject(IntPtr.Zero, null);
-                if (job == IntPtr.Zero) return false;
+                if (percent >= 100)
+                {
+                    RestorePidUnlocked(pid);
+                    return true;
+                }
 
-                IntPtr hProc = OpenProcess(ProcessSetQuota | ProcessTerminate, false, pid);
-                if (hProc == IntPtr.Zero)
+                IntPtr job;
+                if (!Jobs.TryGetValue(pid, out job) || job == IntPtr.Zero)
                 {
-                    CloseHandle(job);
-                    return false;
+                    job = CreateJobObject(IntPtr.Zero, null);
+                    if (job == IntPtr.Zero) return false;
+
+                    IntPtr hProc = OpenProcess(ProcessSetQuota | ProcessTerminate, false, pid);
+                    if (hProc == IntPtr.Zero)
+                    {
+                        CloseHandle(job);
+                        return false;
+                    }
+                    bool assigned;
+                    try { assigned = AssignProcessToJobObject(job, hProc); }
+                    finally { CloseHandle(hProc); }
+                    if (!assigned)
+                    {
+                        CloseHandle(job);
+                        return false;
+                    }
+                    Jobs[pid] = job;
                 }
-                bool assigned;
-                try { assigned = AssignProcessToJobObject(job, hProc); }
-                finally { CloseHandle(hProc); }
-                if (!assigned)
-                {
-                    CloseHandle(job);
-                    return false;
-                }
-                Jobs[pid] = job;
+                return ApplyRate(job, percent);
             }
-            return ApplyRate(job, percent);
         }
 
-        public static void RestorePid(int pid)
+        private static void RestorePidUnlocked(int pid)
         {
             IntPtr job;
             if (!Jobs.TryGetValue(pid, out job)) return;
@@ -955,27 +1134,38 @@ namespace GameMuteHelper
             Jobs.Remove(pid);
         }
 
+        public static void RestorePid(int pid)
+        {
+            lock (Sync) { RestorePidUnlocked(pid); }
+        }
+
         public static void RestoreAll()
         {
-            foreach (KeyValuePair<int, IntPtr> kv in Jobs) { ApplyRate(kv.Value, 100); }
-            foreach (KeyValuePair<int, IntPtr> kv in Jobs) { CloseHandle(kv.Value); }
-            Jobs.Clear();
+            lock (Sync)
+            {
+                foreach (KeyValuePair<int, IntPtr> kv in Jobs) { ApplyRate(kv.Value, 100); }
+                foreach (KeyValuePair<int, IntPtr> kv in Jobs) { CloseHandle(kv.Value); }
+                Jobs.Clear();
+            }
         }
 
         public static void Cleanup(HashSet<int> livePids)
         {
-            if (Jobs.Count == 0) return;
-            List<int> dead = null;
-            foreach (int pid in Jobs.Keys)
+            lock (Sync)
             {
-                if (!livePids.Contains(pid))
+                if (Jobs.Count == 0) return;
+                List<int> dead = null;
+                foreach (int pid in Jobs.Keys)
                 {
-                    if (dead == null) dead = new List<int>();
-                    dead.Add(pid);
+                    if (!livePids.Contains(pid))
+                    {
+                        if (dead == null) dead = new List<int>();
+                        dead.Add(pid);
+                    }
                 }
+                if (dead == null) return;
+                for (int i = 0; i < dead.Count; i++) RestorePidUnlocked(dead[i]);
             }
-            if (dead == null) return;
-            for (int i = 0; i < dead.Count; i++) RestorePid(dead[i]);
         }
 
         private static bool ApplyRate(IntPtr job, int percent)
@@ -1035,7 +1225,7 @@ namespace GameMuteHelper
             public int Fps;
             public ManualResetEvent Stop;
             public Thread Thread;
-            public bool Failed;
+            public volatile bool Failed;
             public int LastStatus;
             public DateTime RetryAfterUtc;
             public bool LoggedOk;
@@ -1174,7 +1364,14 @@ namespace GameMuteHelper
 
         public static bool HasActiveWorkers()
         {
-            lock (Sync) { return Workers.Count > 0; }
+            lock (Sync)
+            {
+                foreach (Worker w in Workers.Values)
+                {
+                    if (!w.Failed) return true;
+                }
+                return false;
+            }
         }
 
         public static bool HasFailed(int pid)
@@ -1196,12 +1393,34 @@ namespace GameMuteHelper
             ProcessStartInfo psi = new ProcessStartInfo("schtasks.exe", args);
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError = true;
             using (Process p = Process.Start(psi))
             {
-                p.WaitForExit(5000);
+                if (!p.WaitForExit(5000))
+                {
+                    try { p.Kill(); } catch { }
+                    return -1;
+                }
                 return p.ExitCode;
+            }
+        }
+
+        private static string RunSchtasksOutput(string args, out int exitCode)
+        {
+            exitCode = -1;
+            ProcessStartInfo psi = new ProcessStartInfo("schtasks.exe", args);
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            using (Process p = Process.Start(psi))
+            {
+                string output = p.StandardOutput.ReadToEnd();
+                if (!p.WaitForExit(5000))
+                {
+                    try { p.Kill(); } catch { }
+                    return "";
+                }
+                exitCode = p.ExitCode;
+                return output ?? "";
             }
         }
 
@@ -1209,6 +1428,47 @@ namespace GameMuteHelper
         {
             try { return RunSchtasks("/Query /TN \"" + TaskName + "\"") == 0; }
             catch { return false; }
+        }
+
+        // 读取计划任务当前指向的可执行文件路径（解析标准 XML 的 <Command> 节点，不受系统语言影响）
+        public static string GetRegisteredExePath()
+        {
+            try
+            {
+                int code;
+                string xml = RunSchtasksOutput("/Query /TN \"" + TaskName + "\" /XML", out code);
+                if (code != 0 || string.IsNullOrEmpty(xml)) return "";
+                int s = xml.IndexOf("<Command>", StringComparison.OrdinalIgnoreCase);
+                if (s < 0) return "";
+                s += "<Command>".Length;
+                int e = xml.IndexOf("</Command>", s, StringComparison.OrdinalIgnoreCase);
+                if (e < 0) return "";
+                return xml.Substring(s, e - s).Trim().Trim('"');
+            }
+            catch { return ""; }
+        }
+
+        // 若已开启开机自启，但计划任务仍指向旧版本/旧目录的 EXE，自动更新到当前 EXE 路径
+        public static bool SyncPathIfEnabled(bool isAdmin)
+        {
+            try
+            {
+                if (!IsEnabled()) return false;
+                string currentExe = (Application.ExecutablePath ?? "").Trim().Trim('"');
+                string registered = GetRegisteredExePath();
+                if (string.IsNullOrEmpty(currentExe)) return false;
+                if (string.Equals(registered, currentExe, StringComparison.OrdinalIgnoreCase)) return false;
+
+                bool ok = SetEnabled(true, isAdmin);
+                AppLogger.Log(string.Format("Autostart path synced: '{0}' -> '{1}' (ok={2})",
+                    registered, currentExe, ok), ok ? "INFO" : "WARN");
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log("Autostart sync error: " + ex.Message, "WARN");
+                return false;
+            }
         }
 
         public static bool SetEnabled(bool enable, bool isAdmin)
@@ -1265,39 +1525,39 @@ namespace GameMuteHelper
             if (Scale < 1.0f) Scale = 1.0f;
         }
 
-        // Crisp, airy Daylight Palette (Apple / Win11 Mica inspired)
-        public static readonly Color Bg = Color.FromArgb(245, 247, 250);
+        // Flat Minimalist Neutral Palette (Linear / Notion / Win11 inspired)
+        public static readonly Color Bg = Color.FromArgb(250, 250, 250);
         public static readonly Color Surface = Color.FromArgb(255, 255, 255);
         public static readonly Color CardBg = Color.FromArgb(255, 255, 255);
-        public static readonly Color CardHover = Color.FromArgb(249, 251, 255);
-        public static readonly Color InputBg = Color.FromArgb(238, 241, 246);
-        public static readonly Color InputHover = Color.FromArgb(230, 235, 243);
-        public static readonly Color Border = Color.FromArgb(226, 232, 240);
-        public static readonly Color BorderHover = Color.FromArgb(203, 213, 225);
+        public static readonly Color CardHover = Color.FromArgb(248, 248, 249);
+        public static readonly Color InputBg = Color.FromArgb(244, 244, 245);
+        public static readonly Color InputHover = Color.FromArgb(232, 232, 236);
+        public static readonly Color Border = Color.FromArgb(234, 234, 236);
+        public static readonly Color BorderHover = Color.FromArgb(209, 209, 214);
 
-        public static readonly Color Text = Color.FromArgb(17, 24, 39);
-        public static readonly Color TextMuted = Color.FromArgb(100, 116, 139);
-        public static readonly Color TextDim = Color.FromArgb(148, 163, 184);
+        public static readonly Color Text = Color.FromArgb(24, 24, 27);
+        public static readonly Color TextMuted = Color.FromArgb(113, 113, 122);
+        public static readonly Color TextDim = Color.FromArgb(161, 161, 170);
 
-        public static readonly Color Accent = Color.FromArgb(37, 99, 235);
-        public static readonly Color AccentHover = Color.FromArgb(29, 78, 216);
-        public static readonly Color AccentSoft = Color.FromArgb(239, 246, 255);
+        public static readonly Color Accent = Color.FromArgb(24, 24, 27);
+        public static readonly Color AccentHover = Color.FromArgb(52, 52, 58);
+        public static readonly Color AccentSoft = Color.FromArgb(244, 244, 245);
 
-        public static readonly Color Green = Color.FromArgb(5, 150, 105);
-        public static readonly Color GreenSoft = Color.FromArgb(236, 253, 245);
+        public static readonly Color Green = Color.FromArgb(22, 163, 74);
+        public static readonly Color GreenSoft = Color.FromArgb(240, 253, 244);
 
-        public static readonly Color Amber = Color.FromArgb(217, 119, 6);
-        public static readonly Color AmberSoft = Color.FromArgb(255, 251, 235);
+        public static readonly Color Amber = Color.FromArgb(180, 83, 9);
+        public static readonly Color AmberSoft = Color.FromArgb(254, 243, 199);
 
         public static readonly Color Red = Color.FromArgb(220, 38, 38);
         public static readonly Color RedSoft = Color.FromArgb(254, 242, 242);
 
-        public static readonly Font FontBrand = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold);
-        public static readonly Font FontHeading = new Font("Microsoft YaHei UI", 10f, FontStyle.Bold);
-        public static readonly Font FontBody = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
-        public static readonly Font FontBodyBold = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
-        public static readonly Font FontSmall = new Font("Microsoft YaHei UI", 8.2f, FontStyle.Regular);
-        public static readonly Font FontSmallBold = new Font("Microsoft YaHei UI", 8.2f, FontStyle.Bold);
+        public static readonly Font FontBrand = new Font("Microsoft YaHei UI", 11.5f, FontStyle.Bold);
+        public static readonly Font FontHeading = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
+        public static readonly Font FontBody = new Font("Microsoft YaHei UI", 8.8f, FontStyle.Regular);
+        public static readonly Font FontBodyBold = new Font("Microsoft YaHei UI", 8.8f, FontStyle.Bold);
+        public static readonly Font FontSmall = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular);
+        public static readonly Font FontSmallBold = new Font("Microsoft YaHei UI", 8f, FontStyle.Bold);
 
         public static GraphicsPath RoundedRect(Rectangle rect, int radius)
         {
@@ -1318,6 +1578,9 @@ namespace GameMuteHelper
             return path;
         }
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
         public static Icon CreateAppIcon(Color accentColor, bool mutedSlash)
         {
             using (Bitmap bmp = new Bitmap(32, 32))
@@ -1326,18 +1589,17 @@ namespace GameMuteHelper
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
 
-                using (SolidBrush bg = new SolidBrush(Color.White))
-                using (Pen border = new Pen(accentColor, 2.4f))
-                using (SolidBrush fg = new SolidBrush(accentColor))
-                using (Pen wave = new Pen(accentColor, 2.2f))
+                using (GraphicsPath bgPath = RoundedRect(new Rectangle(2, 2, 28, 28), 8))
+                using (SolidBrush bg = new SolidBrush(accentColor))
+                using (SolidBrush fg = new SolidBrush(Color.White))
+                using (Pen wave = new Pen(Color.White, 2.2f))
                 {
-                    g.FillEllipse(bg, 2, 2, 28, 28);
-                    g.DrawEllipse(border, 2, 2, 28, 28);
+                    g.FillPath(bg, bgPath);
 
                     Point[] pts = new Point[]
                     {
-                        new Point(8, 13), new Point(13, 13), new Point(18, 8),
-                        new Point(18, 24), new Point(13, 19), new Point(8, 19)
+                        new Point(7, 13), new Point(12, 13), new Point(17, 8),
+                        new Point(17, 24), new Point(12, 19), new Point(7, 19)
                     };
                     g.FillPolygon(fg, pts);
 
@@ -1345,16 +1607,26 @@ namespace GameMuteHelper
                     wave.EndCap = LineCap.Round;
                     if (mutedSlash)
                     {
-                        g.DrawLine(wave, 21, 13, 26, 19);
-                        g.DrawLine(wave, 26, 13, 21, 19);
+                        g.DrawLine(wave, 20, 13, 25, 19);
+                        g.DrawLine(wave, 25, 13, 20, 19);
                     }
                     else
                     {
-                        g.DrawArc(wave, 16, 11, 8, 10, -50, 100);
+                        g.DrawArc(wave, 15, 11, 8, 10, -50, 100);
                     }
                 }
                 IntPtr hIcon = bmp.GetHicon();
-                return Icon.FromHandle(hIcon);
+                try
+                {
+                    using (Icon tmp = Icon.FromHandle(hIcon))
+                    {
+                        return (Icon)tmp.Clone();
+                    }
+                }
+                finally
+                {
+                    DestroyIcon(hIcon);
+                }
             }
         }
     }
@@ -1383,7 +1655,7 @@ namespace GameMuteHelper
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.SupportsTransparentBackColor, true);
-            Size = new Size(Theme.S(38), Theme.S(20));
+            Size = new Size(Theme.S(34), Theme.S(18));
             Cursor = Cursors.Hand;
             BackColor = Color.Transparent;
         }
@@ -1404,11 +1676,11 @@ namespace GameMuteHelper
             Rectangle track = new Rectangle(1, 1, Width - 3, Height - 3);
             Color trackColor;
             if (!Enabled)
-                trackColor = Color.FromArgb(226, 232, 240);
+                trackColor = Color.FromArgb(234, 234, 236);
             else if (_checked)
                 trackColor = _hovered ? Theme.AccentHover : Theme.Accent;
             else
-                trackColor = _hovered ? Color.FromArgb(186, 197, 212) : Color.FromArgb(203, 213, 225);
+                trackColor = _hovered ? Color.FromArgb(196, 196, 202) : Color.FromArgb(216, 216, 222);
 
             using (GraphicsPath p = Theme.RoundedRect(track, track.Height / 2))
             using (SolidBrush br = new SolidBrush(trackColor))
@@ -1420,7 +1692,7 @@ namespace GameMuteHelper
             int knobSize = Height - pad * 2;
             int knobX = _checked ? (Width - knobSize - pad) : pad;
             Rectangle knob = new Rectangle(knobX, pad, knobSize, knobSize);
-            Color knobColor = Enabled ? Color.White : Color.FromArgb(248, 250, 252);
+            Color knobColor = Enabled ? Color.White : Color.FromArgb(248, 248, 250);
             using (SolidBrush kbr = new SolidBrush(knobColor))
             {
                 g.FillEllipse(kbr, knob);
@@ -1435,7 +1707,7 @@ namespace GameMuteHelper
         private bool _hovered;
         private bool _pressed;
         private PillStyle _style = PillStyle.Subtle;
-        private int _radius = 8;
+        private int _radius = 6;
 
         public PillStyle Style
         {
@@ -1460,10 +1732,10 @@ namespace GameMuteHelper
             BackColor = Color.Transparent;
         }
 
-        protected override void OnMouseEnter(EventArgs e) { _hovered = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseEnter(EventArgs e) { if (Enabled) { _hovered = true; Invalidate(); } base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { _hovered = false; _pressed = false; Invalidate(); base.OnMouseLeave(e); }
-        protected override void OnMouseDown(MouseEventArgs e) { _pressed = true; Invalidate(); base.OnMouseDown(e); }
-        protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (Enabled && e.Button == MouseButtons.Left) { _pressed = true; Invalidate(); } base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { if (_pressed) { _pressed = false; Invalidate(); } base.OnMouseUp(e); }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -1476,9 +1748,18 @@ namespace GameMuteHelper
             Color border = Color.Transparent;
             Color fg = Theme.Text;
 
-            if (_style == PillStyle.Accent)
+            if (!Enabled)
             {
-                fill = _pressed ? Color.FromArgb(29, 78, 216) : (_hovered ? Theme.AccentHover : Theme.Accent);
+                if (_style == PillStyle.Subtle)
+                {
+                    fill = Theme.Bg;
+                    border = Theme.Border;
+                }
+                fg = Theme.TextDim;
+            }
+            else if (_style == PillStyle.Accent)
+            {
+                fill = _pressed ? Color.FromArgb(12, 12, 14) : (_hovered ? Theme.AccentHover : Theme.Accent);
                 fg = Color.White;
             }
             else if (_style == PillStyle.Subtle)
@@ -1586,7 +1867,7 @@ namespace GameMuteHelper
 
         protected override void OnMouseClick(MouseEventArgs e)
         {
-            SelectedIndex = (e.X < Width / 2) ? 0 : 1;
+            if (e.Button == MouseButtons.Left) SelectedIndex = (e.X < Width / 2) ? 0 : 1;
             base.OnMouseClick(e);
         }
 
@@ -1597,7 +1878,7 @@ namespace GameMuteHelper
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
             Rectangle outer = new Rectangle(1, 1, Width - 3, Height - 3);
-            using (GraphicsPath p = Theme.RoundedRect(outer, Theme.S(9)))
+            using (GraphicsPath p = Theme.RoundedRect(outer, Theme.S(7)))
             using (SolidBrush bg = new SolidBrush(Theme.InputBg))
             {
                 g.FillPath(bg, p);
@@ -1616,7 +1897,7 @@ namespace GameMuteHelper
         {
             if (active)
             {
-                using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(7)))
+                using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(5)))
                 using (SolidBrush br = new SolidBrush(Theme.Surface))
                 using (Pen bd = new Pen(Theme.Border, 1f))
                 {
@@ -1635,6 +1916,7 @@ namespace GameMuteHelper
     {
         private readonly TextBox _tb;
         private bool _focused;
+        private string _lastQuery = "";
         private const string Placeholder = "搜索游戏、进程名或窗口标题...";
 
         public event EventHandler QueryChanged;
@@ -1654,6 +1936,7 @@ namespace GameMuteHelper
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Size = new Size(Theme.S(300), Theme.S(34));
             BackColor = Theme.Bg;
+            Cursor = Cursors.IBeam;
             Padding = new Padding(Theme.S(32), Theme.S(7), Theme.S(10), Theme.S(5));
 
             _tb = new TextBox();
@@ -1684,10 +1967,22 @@ namespace GameMuteHelper
                 }
                 Invalidate();
             };
+            _tb.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Escape && _tb.Text != Placeholder && _tb.Text.Length > 0)
+                {
+                    e.SuppressKeyPress = true;
+                    _tb.Text = "";
+                }
+            };
             _tb.TextChanged += (s, e) =>
             {
+                string q = Query;
+                if (string.Equals(q, _lastQuery, StringComparison.Ordinal)) return;
+                _lastQuery = q;
                 if (QueryChanged != null) QueryChanged(this, EventArgs.Empty);
             };
+            Click += (s, e) => _tb.Focus();
             Controls.Add(_tb);
         }
 
@@ -1696,9 +1991,9 @@ namespace GameMuteHelper
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
-            using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(9)))
+            using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(6)))
             using (SolidBrush br = new SolidBrush(Theme.Surface))
-            using (Pen bd = new Pen(_focused ? Theme.Accent : Theme.Border, _focused ? 1.4f : 1f))
+            using (Pen bd = new Pen(_focused ? Theme.Accent : Theme.Border, _focused ? 1.2f : 1f))
             {
                 g.FillPath(br, p);
                 g.DrawPath(bd, p);
@@ -1785,16 +2080,17 @@ namespace GameMuteHelper
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.SupportsTransparentBackColor, true);
-            Size = new Size(Theme.S(64), Theme.S(24));
+            Size = new Size(Theme.S(60), Theme.S(26));
             Font = Theme.FontSmallBold;
             Cursor = Cursors.Hand;
             BackColor = Color.Transparent;
             TabStop = false;
 
             _repeatTimer = new System.Windows.Forms.Timer();
-            _repeatTimer.Interval = 110;
+            _repeatTimer.Interval = 350;
             _repeatTimer.Tick += delegate
             {
+                if (_repeatTimer.Interval != 100) _repeatTimer.Interval = 100;
                 if (_pressedUp) Bump(_step);
                 else if (_pressedDown) Bump(-_step);
             };
@@ -1834,12 +2130,14 @@ namespace GameMuteHelper
         private void Bump(int delta)
         {
             if (_editing) return;
+            int old = _value;
             Value = _value + delta;
-            if (EditCommitted != null) EditCommitted(this, EventArgs.Empty);
+            if (_value != old && EditCommitted != null) EditCommitted(this, EventArgs.Empty);
         }
 
         protected override void OnMouseEnter(EventArgs e)
         {
+            if (!Enabled) { base.OnMouseEnter(e); return; }
             _hovered = true;
             Invalidate();
             base.OnMouseEnter(e);
@@ -1852,13 +2150,14 @@ namespace GameMuteHelper
             _hoverDown = false;
             _pressedUp = false;
             _pressedDown = false;
-            _repeatTimer.Stop();
-            Invalidate();
+            if (_repeatTimer != null) _repeatTimer.Stop();
+            if (!IsDisposed) Invalidate();
             base.OnMouseLeave(e);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
+            if (!Enabled) { base.OnMouseMove(e); return; }
             bool hu = UpRect().Contains(e.Location);
             bool hd = DownRect().Contains(e.Location);
             if (hu != _hoverUp || hd != _hoverDown)
@@ -1873,22 +2172,30 @@ namespace GameMuteHelper
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (!Enabled) return;
+            if (!Enabled || e.Button != MouseButtons.Left) return;
             Focus();
 
             if (UpRect().Contains(e.Location))
             {
                 _pressedUp = true;
                 Bump(_step);
-                _repeatTimer.Start();
-                Invalidate();
+                if (!IsDisposed && _repeatTimer != null)
+                {
+                    _repeatTimer.Interval = 350;
+                    _repeatTimer.Start();
+                    Invalidate();
+                }
             }
             else if (DownRect().Contains(e.Location))
             {
                 _pressedDown = true;
                 Bump(-_step);
-                _repeatTimer.Start();
-                Invalidate();
+                if (!IsDisposed && _repeatTimer != null)
+                {
+                    _repeatTimer.Interval = 350;
+                    _repeatTimer.Start();
+                    Invalidate();
+                }
             }
             else if (ValueRect().Contains(e.Location))
             {
@@ -1901,8 +2208,8 @@ namespace GameMuteHelper
             bool wasRepeat = _pressedUp || _pressedDown;
             _pressedUp = false;
             _pressedDown = false;
-            _repeatTimer.Stop();
-            if (wasRepeat) Invalidate();
+            if (_repeatTimer != null) _repeatTimer.Stop();
+            if (wasRepeat && !IsDisposed) Invalidate();
             base.OnMouseUp(e);
         }
 
@@ -1963,12 +2270,13 @@ namespace GameMuteHelper
                 done = true;
                 int v;
                 if (!int.TryParse(tb.Text.Trim().TrimEnd('%'), out v)) v = _value;
+                int old = _value;
                 tb.Dispose();
                 _editing = false;
                 Controls.Remove(tb);
                 Value = v;
                 Invalidate();
-                if (EditCommitted != null) EditCommitted(this, EventArgs.Empty);
+                if (_value != old && EditCommitted != null) EditCommitted(this, EventArgs.Empty);
             };
             cancel = delegate
             {
@@ -2047,12 +2355,21 @@ namespace GameMuteHelper
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
             Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
-            using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(7)))
-            using (SolidBrush br = new SolidBrush(Theme.InputBg))
-            using (Pen bd = new Pen(_hovered ? Theme.BorderHover : Theme.Border, 1f))
+            Color fill = Enabled ? Theme.Surface : Theme.Bg;
+            Color bdColor = !Enabled ? Theme.Border : (_hovered ? Theme.BorderHover : Theme.Border);
+            using (GraphicsPath p = Theme.RoundedRect(r, Theme.S(6)))
+            using (SolidBrush br = new SolidBrush(fill))
+            using (Pen bd = new Pen(bdColor, 1f))
             {
                 g.FillPath(br, p);
                 g.DrawPath(bd, p);
+            }
+
+            // 数字区与箭头区之间的极细分隔线
+            int sepX = Width - ArrowWidth() - Theme.S(7);
+            using (Pen sp = new Pen(Theme.Border, 1f))
+            {
+                g.DrawLine(sp, sepX, Theme.S(5), sepX, Height - Theme.S(6));
             }
 
             // 数字区
@@ -2071,7 +2388,7 @@ namespace GameMuteHelper
 
         private void DrawArrow(Graphics g, Rectangle r, bool hovered, bool pressed, bool up)
         {
-            Color c = pressed ? Theme.Accent : (hovered ? Theme.AccentHover : Theme.TextMuted);
+            Color c = !Enabled ? Theme.TextDim : (pressed ? Theme.Accent : (hovered ? Theme.AccentHover : Theme.TextMuted));
             int cx = r.X + r.Width / 2;
             int cy = r.Y + r.Height / 2;
             int half = Math.Max(2, Math.Min(r.Width, r.Height) / 2 - 1);
@@ -2129,6 +2446,7 @@ namespace GameMuteHelper
     {
         public string ProcessName { get; private set; }
         public bool IsManagedView { get; private set; }
+        public bool IsAlreadyManaged { get; private set; }
 
         private string _windowTitle;
         private string _statusText;
@@ -2136,6 +2454,7 @@ namespace GameMuteHelper
         private Color _statusBg;
         private Image _appIcon;
         private bool _hovered;
+        private ToolTip _tips;
 
         private ToggleSwitch _muteToggle;
         private ToggleSwitch _fpsToggle;
@@ -2153,7 +2472,7 @@ namespace GameMuteHelper
         private string _audioMode = AudioModes.Mute;
         private int _volumePercent = AudioModes.DefaultVolume;
 
-        public event Action<string, bool, bool, int, string, bool> RuleChanged;
+        public event Action<string, bool, int, string, bool> LimitRuleChanged;
         public event Action<string, bool, string, int> AudioRuleChanged;
         public event Action<string> RemoveClicked;
         public event Action<string> AddClicked;
@@ -2166,6 +2485,8 @@ namespace GameMuteHelper
             _windowTitle = title ?? "";
             _appIcon = icon;
             IsManagedView = isManagedView;
+            IsAlreadyManaged = alreadyManaged;
+            _tips = tips;
             _method = LimitMethods.Normalize(method);
             _suspendFallbackCpu = suspendFallbackCpu;
             _statusText = "—";
@@ -2181,7 +2502,7 @@ namespace GameMuteHelper
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
-            Height = Theme.S(64);
+            Height = Theme.S(62);
             BackColor = Theme.Bg;
 
             if (isManagedView && rule != null)
@@ -2193,31 +2514,41 @@ namespace GameMuteHelper
                 BuildRunningControls(alreadyManaged);
             }
 
-            MouseEnter += (s, e) => { _hovered = true; Invalidate(); };
-            MouseLeave += (s, e) =>
+            EventHandler checkLeave = (s, e) =>
             {
-                if (!ClientRectangle.Contains(PointToClient(Cursor.Position)))
+                if (!IsDisposed && !ClientRectangle.Contains(PointToClient(Cursor.Position)))
                 {
-                    _hovered = false;
-                    Invalidate();
+                    if (_hovered) { _hovered = false; Invalidate(); }
                 }
             };
+            MouseEnter += (s, e) => { if (!_hovered) { _hovered = true; Invalidate(); } };
+            MouseLeave += checkLeave;
+            for (int i = 0; i < Controls.Count; i++)
+            {
+                Controls[i].MouseEnter += (s, e) => { if (!_hovered) { _hovered = true; Invalidate(); } };
+                Controls[i].MouseLeave += checkLeave;
+            }
         }
 
         private void BuildManagedControls(AppRule rule, ToolTip tips)
         {
             _muteToggle = new ToggleSwitch();
             _muteToggle.Checked = rule.Mute;
-            _muteToggle.CheckedChanged += (s, e) => NotifyRuleChanged();
+            _muteToggle.CheckedChanged += (s, e) =>
+            {
+                if (_volumeSpinner != null) _volumeSpinner.Enabled = _muteToggle.Checked;
+                Invalidate();
+                NotifyAudioChanged();
+            };
             Controls.Add(_muteToggle);
 
             // 音频方式按钮：完全静音 / 降低音量到指定百分比
             _audioBtn = new PillButton();
             _audioBtn.Style = PillStyle.Subtle;
             _audioBtn.Font = Theme.FontSmall;
-            _audioBtn.CornerRadius = 7;
-            _audioBtn.Size = new Size(Theme.S(72), Theme.S(22));
-            _audioBtn.Text = AudioModes.ShortLabel(_audioMode);
+            _audioBtn.CornerRadius = 6;
+            _audioBtn.Size = new Size(Theme.S(76), Theme.S(26));
+            _audioBtn.Text = AudioModes.ShortLabel(_audioMode) + " ▾";
             _audioBtn.Click += (s, e) => ShowAudioMenu();
             if (tips != null) tips.SetToolTip(_audioBtn, "点击切换后台音频方式：完全静音或降低到指定百分比");
             Controls.Add(_audioBtn);
@@ -2228,6 +2559,7 @@ namespace GameMuteHelper
             _volumeSpinner.Step = 5;
             _volumeSpinner.Suffix = "%";
             _volumeSpinner.Value = _volumePercent;
+            _volumeSpinner.Enabled = _muteToggle.Checked;
             _volumeSpinner.Visible = _audioMode == AudioModes.Attenuate;
             _volumeSpinner.EditCommitted += (s, e) => CommitVolume();
             Controls.Add(_volumeSpinner);
@@ -2243,7 +2575,7 @@ namespace GameMuteHelper
                     _fpsSpinner.Enabled = _fpsToggle.Checked;
                 }
                 Invalidate();
-                NotifyRuleChanged();
+                NotifyLimitChanged();
             };
             Controls.Add(_fpsToggle);
 
@@ -2263,16 +2595,16 @@ namespace GameMuteHelper
             _methodBtn = new PillButton();
             _methodBtn.Style = PillStyle.Subtle;
             _methodBtn.Font = Theme.FontSmall;
-            _methodBtn.CornerRadius = 7;
-            _methodBtn.Size = new Size(Theme.S(58), Theme.S(22));
-            _methodBtn.Text = LimitMethods.ShortLabel(_method);
+            _methodBtn.CornerRadius = 6;
+            _methodBtn.Size = new Size(Theme.S(56), Theme.S(26));
+            _methodBtn.Text = LimitMethods.ShortLabel(_method) + " ▾";
             _methodBtn.Click += (s, e) => ShowMethodMenu();
             if (tips != null) tips.SetToolTip(_methodBtn, "点击切换该应用的限帧方式");
             Controls.Add(_methodBtn);
 
             _actionBtn = new PillButton();
-            _actionBtn.Size = new Size(Theme.S(28), Theme.S(28));
-            _actionBtn.CornerRadius = 7;
+            _actionBtn.Size = new Size(Theme.S(26), Theme.S(26));
+            _actionBtn.CornerRadius = 6;
             _actionBtn.Style = PillStyle.DangerIcon;
             _actionBtn.Click += (s, e) => { if (RemoveClicked != null) RemoveClicked(ProcessName); };
             if (tips != null) tips.SetToolTip(_actionBtn, "从接管列表中移除");
@@ -2310,14 +2642,16 @@ namespace GameMuteHelper
 
             _audioMode = m;
             bool atten = AudioModes.IsAttenuate(_audioMode);
-            if (_audioBtn != null) _audioBtn.Text = AudioModes.ShortLabel(_audioMode);
+            if (_audioBtn != null) _audioBtn.Text = AudioModes.ShortLabel(_audioMode) + " ▾";
             if (_volumeSpinner != null)
             {
                 _volumeSpinner.Visible = atten;
+                _volumeSpinner.Enabled = _muteToggle != null && _muteToggle.Checked;
                 if (atten) _volumeSpinner.Value = _volumePercent;
             }
+            LayoutChildControls();
             Invalidate();
-            NotifyRuleChanged();
+            NotifyAudioChanged();
         }
 
         private int ParseVolume()
@@ -2331,7 +2665,7 @@ namespace GameMuteHelper
         {
             if (_volumeSpinner == null || !_volumeSpinner.Visible) return;
             ParseVolume();
-            NotifyRuleChanged();
+            NotifyAudioChanged();
         }
 
         private void BuildRunningControls(bool alreadyManaged)
@@ -2377,15 +2711,19 @@ namespace GameMuteHelper
             if (_fpsSpinner == null) return;
             ParseValue();
             _fpsSpinner.Value = _value; // 同步回控件（含 clamp 后的显示）
-            NotifyRuleChanged();
+            NotifyLimitChanged();
         }
 
-        private void NotifyRuleChanged()
+        private void NotifyLimitChanged()
         {
-            if (RuleChanged != null && _muteToggle != null && _fpsToggle != null)
+            if (LimitRuleChanged != null && _fpsToggle != null)
             {
-                RuleChanged(ProcessName, _muteToggle.Checked, _fpsToggle.Checked, ParseValue(), _method, _suspendFallbackCpu);
+                LimitRuleChanged(ProcessName, _fpsToggle.Checked, ParseValue(), _method, _suspendFallbackCpu);
             }
+        }
+
+        private void NotifyAudioChanged()
+        {
             if (AudioRuleChanged != null && _muteToggle != null)
             {
                 AudioRuleChanged(ProcessName, _muteToggle.Checked, _audioMode, _volumePercent);
@@ -2417,7 +2755,7 @@ namespace GameMuteHelper
                 {
                     _suspendFallbackCpu = !_suspendFallbackCpu;
                     _fallbackMenuItem.Checked = _suspendFallbackCpu;
-                    NotifyRuleChanged();
+                    NotifyLimitChanged();
                 };
                 _methodMenu.Items.Add(_fallbackMenuItem);
             }
@@ -2432,7 +2770,7 @@ namespace GameMuteHelper
 
             _method = m;
             _value = LimitMethods.Clamp(_method, _value);
-            if (_methodBtn != null) _methodBtn.Text = LimitMethods.ShortLabel(_method);
+            if (_methodBtn != null) _methodBtn.Text = LimitMethods.ShortLabel(_method) + " ▾";
 
             bool available = MethodAvailable(_method);
             if (_fpsToggle != null)
@@ -2446,9 +2784,10 @@ namespace GameMuteHelper
                 _fpsSpinner.Suffix = m == LimitMethods.Cpu ? "%" : "";
                 _fpsSpinner.Value = _value;
                 _fpsSpinner.Enabled = _fpsToggle != null && _fpsToggle.Checked;
+                if (_tips != null) _tips.SetToolTip(_fpsSpinner, ValueTooltip(_method) + "；点击数字直接输入，箭头 ±5");
             }
             Invalidate();
-            NotifyRuleChanged();
+            NotifyLimitChanged();
         }
 
         protected override void Dispose(bool disposing)
@@ -2467,6 +2806,14 @@ namespace GameMuteHelper
             string t = title ?? "";
             if (_windowTitle == t) return;
             _windowTitle = t;
+            Invalidate();
+        }
+
+        // 原地更新图标（异步扫描完成后补全图标）
+        public void UpdateIcon(Image icon)
+        {
+            if (_appIcon == icon) return;
+            _appIcon = icon;
             Invalidate();
         }
 
@@ -2491,6 +2838,9 @@ namespace GameMuteHelper
             // SpinnerInput 自带点击处理（箭头 ±5 / 数字区直接输入），无需转发
         }
 
+        private int _dividerX;
+        private int _controlsLeft;
+
         private void LayoutChildControls()
         {
             int w = ClientSize.Width;
@@ -2499,25 +2849,75 @@ namespace GameMuteHelper
 
             if (IsManagedView)
             {
+                int gap = Theme.S(6);
+                int x = w - Theme.S(12);
+
+                // 移除按钮
                 if (_actionBtn != null)
-                    _actionBtn.Location = new Point(w - Theme.S(40), (h - _actionBtn.Height) / 2);
+                {
+                    x -= _actionBtn.Width;
+                    _actionBtn.Location = new Point(x, (h - _actionBtn.Height) / 2);
+                    x -= Theme.S(10);
+                }
+
+                // 限帧组（左→右一致顺序：开关 → 方式 → 数值）
                 if (_fpsSpinner != null)
-                    _fpsSpinner.Location = new Point(w - Theme.S(114), (h - _fpsSpinner.Height) / 2);
-                if (_fpsToggle != null)
-                    _fpsToggle.Location = new Point(w - Theme.S(156), (h - _fpsToggle.Height) / 2);
+                {
+                    x -= _fpsSpinner.Width;
+                    _fpsSpinner.Location = new Point(x, (h - _fpsSpinner.Height) / 2);
+                    x -= gap;
+                }
                 if (_methodBtn != null)
-                    _methodBtn.Location = new Point(w - Theme.S(216), (h - _methodBtn.Height) / 2);
-                if (_muteToggle != null)
-                    _muteToggle.Location = new Point(w - Theme.S(256), (h - _muteToggle.Height) / 2);
+                {
+                    x -= _methodBtn.Width;
+                    _methodBtn.Location = new Point(x, (h - _methodBtn.Height) / 2);
+                    x -= gap;
+                }
+                if (_fpsToggle != null)
+                {
+                    x -= _fpsToggle.Width;
+                    _fpsToggle.Location = new Point(x, (h - _fpsToggle.Height) / 2);
+                }
+
+                // 音频组与限帧组之间的极细竖向分隔线
+                x -= Theme.S(10);
+                _dividerX = x;
+                x -= Theme.S(10);
+
+                // 音频组（左→右一致顺序：开关 → 方式 → [百分比]）
+                if (_volumeSpinner != null && _volumeSpinner.Visible)
+                {
+                    x -= _volumeSpinner.Width;
+                    _volumeSpinner.Location = new Point(x, (h - _volumeSpinner.Height) / 2);
+                    x -= gap;
+                }
                 if (_audioBtn != null)
-                    _audioBtn.Location = new Point(w - Theme.S(330), (h - _audioBtn.Height) / 2);
-                if (_volumeSpinner != null)
-                    _volumeSpinner.Location = new Point(w - Theme.S(400), (h - _volumeSpinner.Height) / 2);
+                {
+                    x -= _audioBtn.Width;
+                    _audioBtn.Location = new Point(x, (h - _audioBtn.Height) / 2);
+                    x -= gap;
+                }
+                if (_muteToggle != null)
+                {
+                    x -= _muteToggle.Width;
+                    _muteToggle.Location = new Point(x, (h - _muteToggle.Height) / 2);
+                }
+
+                _controlsLeft = x - Theme.S(14);
             }
             else
             {
+                _dividerX = 0;
                 if (_actionBtn != null)
-                    _actionBtn.Location = new Point(w - Theme.S(98), (h - _actionBtn.Height) / 2);
+                {
+                    int ax = w - Theme.S(14) - _actionBtn.Width;
+                    _actionBtn.Location = new Point(ax, (h - _actionBtn.Height) / 2);
+                    _controlsLeft = ax - Theme.S(12);
+                }
+                else
+                {
+                    _controlsLeft = w - Theme.S(14);
+                }
             }
         }
 
@@ -2528,12 +2928,22 @@ namespace GameMuteHelper
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
             Rectangle card = new Rectangle(1, 1, Width - 3, Height - 3);
-            using (GraphicsPath path = Theme.RoundedRect(card, Theme.S(11)))
+            using (GraphicsPath path = Theme.RoundedRect(card, Theme.S(8)))
             using (SolidBrush bg = new SolidBrush(_hovered ? Theme.CardHover : Theme.CardBg))
             using (Pen bd = new Pen(_hovered ? Theme.BorderHover : Theme.Border, 1f))
             {
                 g.FillPath(bg, path);
                 g.DrawPath(bd, path);
+            }
+
+            // 音频组与限帧组分隔线
+            if (IsManagedView && _dividerX > Theme.S(180))
+            {
+                int divPad = Theme.S(18);
+                using (Pen divPen = new Pen(Theme.Border, 1f))
+                {
+                    g.DrawLine(divPen, _dividerX, divPad, _dividerX, Height - divPad);
+                }
             }
 
             int icoSize = Theme.S(34);
@@ -2544,54 +2954,53 @@ namespace GameMuteHelper
             }
             else
             {
-                using (GraphicsPath ip = Theme.RoundedRect(iconBox, Theme.S(9)))
-                using (SolidBrush ibr = new SolidBrush(Theme.AccentSoft))
+                using (GraphicsPath ip = Theme.RoundedRect(iconBox, Theme.S(7)))
+                using (SolidBrush ibr = new SolidBrush(Theme.InputBg))
                 {
                     g.FillPath(ibr, ip);
                 }
                 string initial = string.IsNullOrEmpty(ProcessName) ? "?" : ProcessName.Substring(0, 1).ToUpperInvariant();
-                TextRenderer.DrawText(g, initial, Theme.FontHeading, iconBox, Theme.Accent,
+                TextRenderer.DrawText(g, initial, Theme.FontHeading, iconBox, Theme.TextMuted,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
 
-            // 右侧控件（从右到左）：X(40) FPS框(114) FPS开关(156) 方式(216) 音频开关(256)
-            // 音频按钮(330) 音量框(400) 标签(448) 状态胶囊(536)
-            int rightReserve = IsManagedView ? Theme.S(536) : Theme.S(204);
-            int textX = Theme.S(60);
-            int textWidth = Math.Max(Theme.S(100), Width - textX - rightReserve);
+            int textX = Theme.S(58);
+            int rightLimit = _controlsLeft > textX + Theme.S(60) ? _controlsLeft : (Width - Theme.S(16));
+            int availW = Math.Max(Theme.S(80), rightLimit - textX);
 
-            Rectangle nameRect = new Rectangle(textX, Theme.S(12), textWidth, Theme.S(20));
-            Rectangle titleRect = new Rectangle(textX, Theme.S(34), textWidth, Theme.S(18));
+            // 状态标签紧随进程名右侧（扁平小胶囊），既不挤压右侧控件也不遮挡长标题
+            string status = _statusText ?? "";
+            Size statusSize = TextRenderer.MeasureText(g, status, Theme.FontSmallBold,
+                new Size(Theme.S(160), Theme.S(20)), TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            int pillW = Math.Max(Theme.S(46), Math.Min(Theme.S(160), statusSize.Width + Theme.S(14)));
+            int pillH = Theme.S(20);
+
+            Size nameSize = TextRenderer.MeasureText(g, ProcessName ?? "", Theme.FontBodyBold,
+                new Size(availW, Theme.S(20)), TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            int maxNameW = Math.Max(Theme.S(64), availW - pillW - Theme.S(8));
+            int drawNameW = Math.Min(nameSize.Width + Theme.S(2), maxNameW);
+
+            Rectangle nameRect = new Rectangle(textX, Theme.S(11), drawNameW, Theme.S(20));
             TextRenderer.DrawText(g, ProcessName, Theme.FontBodyBold, nameRect, Theme.Text,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
-            string sub = string.IsNullOrEmpty(_windowTitle) ? (ProcessName + ".exe") : _windowTitle;
-            TextRenderer.DrawText(g, sub, Theme.FontSmall, titleRect, Theme.TextMuted,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-
-            int pillW = Theme.S(88);
-            int pillH = Theme.S(24);
-            int pillX = IsManagedView ? (Width - Theme.S(536)) : (Width - Theme.S(198));
-            if (pillX > Theme.S(160))
+            int pillX = textX + drawNameW + Theme.S(6);
+            if (pillX + pillW <= rightLimit + Theme.S(4))
             {
-                Rectangle pillRect = new Rectangle(pillX, (Height - pillH) / 2, pillW, pillH);
-                using (GraphicsPath pp = Theme.RoundedRect(pillRect, pillH / 2))
+                Rectangle pillRect = new Rectangle(pillX, Theme.S(11), pillW, pillH);
+                using (GraphicsPath pp = Theme.RoundedRect(pillRect, Theme.S(5)))
                 using (SolidBrush pbr = new SolidBrush(_statusBg))
                 {
                     g.FillPath(pbr, pp);
                 }
-                TextRenderer.DrawText(g, _statusText, Theme.FontSmallBold, pillRect, _statusFg,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, status, Theme.FontSmallBold, pillRect, _statusFg,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             }
 
-            if (IsManagedView)
-            {
-                int lblH = Theme.S(24);
-                int lblY = (Height - lblH) / 2;
-                Rectangle muteLblRect = new Rectangle(Width - Theme.S(448), lblY, Theme.S(46), lblH);
-                TextRenderer.DrawText(g, "音频", Theme.FontSmall, muteLblRect, Theme.TextMuted,
-                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-            }
+            Rectangle titleRect = new Rectangle(textX, Theme.S(33), availW, Theme.S(18));
+            string sub = string.IsNullOrEmpty(_windowTitle) ? (ProcessName + ".exe") : _windowTitle;
+            TextRenderer.DrawText(g, sub, Theme.FontSmall, titleRect, Theme.TextMuted,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
         }
     }
 
@@ -2613,7 +3022,7 @@ namespace GameMuteHelper
             // 鼠标在卡片列表区域内才处理（用 Bounds 覆盖滚动条区域）
             Point pt = Control.MousePosition;
             Panel host = _form.CardsHost;
-            if (host == null || host.IsDisposed) return false;
+            if (host == null || host.IsDisposed || !host.VerticalScroll.Visible) return false;
             Rectangle hostRect = host.Parent != null
                 ? host.Parent.RectangleToScreen(host.Bounds)
                 : host.RectangleToScreen(host.ClientRectangle);
@@ -2621,14 +3030,16 @@ namespace GameMuteHelper
 
             // 滚轮 delta 在 WParam 的 high-order word（有符号 16 位），向上为正
             int delta = unchecked((short)((m.WParam.ToInt64() >> 16) & 0xffff));
-            int step = Math.Max(30, host.Font.Height * 3);
+            if (delta == 0) return false;
+            int notchStep = Math.Max(36, host.Font.Height * 3);
+            int move = (int)Math.Round(notchStep * (delta / 120.0));
+            if (move == 0) move = delta > 0 ? 12 : -12;
 
             // AutoScrollPosition 的约定：getter 返回负值（向下滚为负），
-            // setter 却要求正值（向下滚为正）。之前把负值直接传给 setter，
-            // 每次滚动都被钳回 0，列表永远滑不动。
+            // setter 却要求正值（向下滚为正）。
             int curDown = -host.AutoScrollPosition.Y; // 当前向下滚动量（>= 0）
-            int newDown = delta > 0 ? curDown - step : curDown + step;
-            int maxDown = host.VerticalScroll.Maximum; // 最大可滚动范围
+            int newDown = curDown - move;
+            int maxDown = Math.Max(0, host.VerticalScroll.Maximum - host.VerticalScroll.LargeChange + 1);
             if (newDown < 0) newDown = 0;
             if (newDown > maxDown) newDown = maxDown;
             Point cur = host.AutoScrollPosition;
@@ -2674,6 +3085,7 @@ namespace GameMuteHelper
             public float FadeFrom;        // 渐变起始音量
             public float FadeTo;          // 渐变目标音量
             public DateTime FadeStartUtc; // 渐变开始时间
+            public DateTime FadeRetryAfterUtc; // 渐变写入失败后的重试退避时间
             public AfterUpKind AfterUp;    // 渐变到原值后的动作
             public DateTime LastSeenUtc;  // 会话最后一次出现在枚举中
 
@@ -2700,6 +3112,7 @@ namespace GameMuteHelper
         {
             public bool Muted;
             public float Volume;
+            public bool Intervened; // 标记本程序是否曾对该应用施加过尚未清理的音频干预
             public DateTime TimeUtc;
         }
         private Dictionary<string, OriginalSnapshot> _lastGoodOriginal;
@@ -2724,7 +3137,9 @@ namespace GameMuteHelper
 
         private bool _paused;
         private bool _exiting;
+        private bool _autostartUpdating;
         private string _lastTrayKey = "";
+        private string _lastSearchQuery = "";
         private bool _scanInFlight;
         private int _lastViewIndex = -1;
 
@@ -2840,8 +3255,8 @@ namespace GameMuteHelper
             ForeColor = Theme.Text;
             Font = Theme.FontBody;
             AutoScaleMode = AutoScaleMode.None; // We handle exact DPI scaling cleanly via Theme.S()
-            ClientSize = new Size(Theme.S(860), Theme.S(580));
-            MinimumSize = new Size(Theme.S(780), Theme.S(480));
+            ClientSize = new Size(Theme.S(880), Theme.S(580));
+            MinimumSize = new Size(Theme.S(760), Theme.S(460));
             StartPosition = FormStartPosition.CenterScreen;
             DoubleBuffered = true;
 
@@ -2858,9 +3273,9 @@ namespace GameMuteHelper
 
             int w = ClientSize.Width;
 
-            // --- 1. Crisp Light Header ---
+            // --- 1. Flat Minimalist Header ---
             Panel header = new Panel();
-            header.Size = new Size(w, Theme.S(74));
+            header.Size = new Size(w, Theme.S(60));
             header.Dock = DockStyle.Top;
             header.BackColor = Theme.Surface;
             header.Paint += (s, e) =>
@@ -2874,38 +3289,41 @@ namespace GameMuteHelper
             brand.Font = Theme.FontBrand;
             brand.ForeColor = Theme.Text;
             brand.AutoSize = true;
-            brand.Location = new Point(Theme.S(22), Theme.S(14));
+            brand.Location = new Point(Theme.S(20), Theme.S(11));
             header.Controls.Add(brand);
 
             _statusBadge = new Label();
             _statusBadge.Font = Theme.FontSmall;
             _statusBadge.ForeColor = Theme.Green;
             _statusBadge.AutoSize = true;
-            _statusBadge.Location = new Point(Theme.S(23), Theme.S(44));
+            _statusBadge.Location = new Point(Theme.S(21), Theme.S(35));
             header.Controls.Add(_statusBadge);
 
-            int btnY = Theme.S(20);
+            int btnY = Theme.S(15);
             _pauseBtn = new PillButton();
             _pauseBtn.Text = "暂停";
             _pauseBtn.Style = PillStyle.Subtle;
-            _pauseBtn.Size = new Size(Theme.S(74), Theme.S(34));
-            _pauseBtn.Location = new Point(w - Theme.S(96), btnY);
+            _pauseBtn.CornerRadius = 6;
+            _pauseBtn.Size = new Size(Theme.S(68), Theme.S(30));
+            _pauseBtn.Location = new Point(w - Theme.S(88), btnY);
             _pauseBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _pauseBtn.Click += (s, e) => SetPaused(!_paused);
             header.Controls.Add(_pauseBtn);
 
             _addExeBtn = new PillButton();
-            _addExeBtn.Text = "+ 添加EXE";
-            _addExeBtn.Style = PillStyle.Subtle;
-            _addExeBtn.Size = new Size(Theme.S(104), Theme.S(34));
-            _addExeBtn.Location = new Point(w - Theme.S(210), btnY);
+            _addExeBtn.Text = "+ 添加";
+            _addExeBtn.Style = PillStyle.Accent;
+            _addExeBtn.CornerRadius = 6;
+            _addExeBtn.Size = new Size(Theme.S(76), Theme.S(30));
+            _addExeBtn.Location = new Point(w - Theme.S(172), btnY);
             _addExeBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _addExeBtn.Click += OnAddExeClicked;
+            _tips.SetToolTip(_addExeBtn, "手动选择 .exe 程序加入接管列表");
             header.Controls.Add(_addExeBtn);
 
             _tabs = new SegmentedTabs();
-            _tabs.Size = new Size(Theme.S(212), Theme.S(34));
-            _tabs.Location = new Point(w - Theme.S(434), btnY);
+            _tabs.Size = new Size(Theme.S(204), Theme.S(30));
+            _tabs.Location = new Point(w - Theme.S(386), btnY);
             _tabs.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _tabs.SelectedIndexChanged += (s, e) =>
             {
@@ -2915,23 +3333,25 @@ namespace GameMuteHelper
             };
             header.Controls.Add(_tabs);
 
-            // --- 2. Airy Search & Status Bar ---
+            // --- 2. Compact Search & Action Strip ---
             Panel toolbar = new Panel();
-            toolbar.Size = new Size(w, Theme.S(56));
+            toolbar.Size = new Size(w, Theme.S(48));
             toolbar.Dock = DockStyle.Top;
             toolbar.BackColor = Theme.Bg;
 
             _searchInput = new SearchInput();
-            _searchInput.Location = new Point(Theme.S(22), Theme.S(12));
-            _searchInput.Size = new Size(Theme.S(310), Theme.S(34));
+            _searchInput.Location = new Point(Theme.S(20), Theme.S(10));
+            _searchInput.Size = new Size(Theme.S(320), Theme.S(30));
             _searchInput.QueryChanged += (s, e) => RebuildCardList();
             toolbar.Controls.Add(_searchInput);
 
             _refreshBtn = new PillButton();
             _refreshBtn.Text = "刷新列表";
             _refreshBtn.Style = PillStyle.Subtle;
-            _refreshBtn.Size = new Size(Theme.S(86), Theme.S(32));
-            _refreshBtn.Location = new Point(Theme.S(344), Theme.S(13));
+            _refreshBtn.CornerRadius = 6;
+            _refreshBtn.Font = Theme.FontSmall;
+            _refreshBtn.Size = new Size(Theme.S(78), Theme.S(30));
+            _refreshBtn.Location = new Point(Theme.S(348), Theme.S(10));
             _refreshBtn.Visible = false;
             _refreshBtn.Click += (s, e) =>
             {
@@ -2942,9 +3362,19 @@ namespace GameMuteHelper
             };
             toolbar.Controls.Add(_refreshBtn);
 
-            // --- 3. Unified Light Minimalist Footer (No ugly Win32 ComboBox) ---
+            Label colHint = new Label();
+            colHint.Text = "音频控制  ·  后台限帧";
+            colHint.Font = Theme.FontSmall;
+            colHint.ForeColor = Theme.TextDim;
+            colHint.AutoSize = true;
+            colHint.Location = new Point(w - Theme.S(160), Theme.S(18));
+            colHint.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            toolbar.Controls.Add(colHint);
+            _tabs.SelectedIndexChanged += (s, e) => { colHint.Visible = (_tabs.SelectedIndex == 0); };
+
+            // --- 3. Flat Minimalist Footer ---
             Panel footer = new Panel();
-            footer.Size = new Size(w, Theme.S(54));
+            footer.Size = new Size(w, Theme.S(46));
             footer.Dock = DockStyle.Bottom;
             footer.BackColor = Theme.Surface;
             footer.Paint += (s, e) =>
@@ -2954,13 +3384,22 @@ namespace GameMuteHelper
             };
 
             _autostartToggle = new ToggleSwitch();
-            _autostartToggle.Location = new Point(Theme.S(22), (footer.Height - _autostartToggle.Height) / 2);
+            _autostartToggle.Location = new Point(Theme.S(20), (footer.Height - _autostartToggle.Height) / 2);
+            AutostartManager.SyncPathIfEnabled(_isAdmin);
             _autostartToggle.Checked = AutostartManager.IsEnabled();
             _autostartToggle.CheckedChanged += (s, e) =>
             {
-                bool ok = AutostartManager.SetEnabled(_autostartToggle.Checked, _isAdmin);
+                if (_autostartUpdating) return;
+                bool want = _autostartToggle.Checked;
+                bool ok = AutostartManager.SetEnabled(want, _isAdmin);
+                if (!ok)
+                {
+                    _autostartUpdating = true;
+                    _autostartToggle.Checked = !want;
+                    _autostartUpdating = false;
+                }
                 SetFooterMessage(ok
-                    ? (_autostartToggle.Checked ? "已开启开机自启（后台托盘）" : "已关闭开机自启")
+                    ? (want ? "已开启开机自启（后台托盘）" : "已关闭开机自启")
                     : "设置开机自启失败，请检查管理员权限");
             };
             footer.Controls.Add(_autostartToggle);
@@ -2970,7 +3409,7 @@ namespace GameMuteHelper
             autoLbl.Font = Theme.FontSmall;
             autoLbl.ForeColor = Theme.TextMuted;
             autoLbl.AutoSize = true;
-            autoLbl.Location = new Point(Theme.S(68), Theme.S(19));
+            autoLbl.Location = new Point(Theme.S(60), Theme.S(15));
             footer.Controls.Add(autoLbl);
 
             // Custom Light Pill Selector for Debounce (replaces ugly ComboBox)
@@ -2999,9 +3438,9 @@ namespace GameMuteHelper
             _debounceBtn.Text = string.Format("防抖 {0}ms ▾", _config.DebounceMs);
             _debounceBtn.Style = PillStyle.Subtle;
             _debounceBtn.Font = Theme.FontSmall;
-            _debounceBtn.CornerRadius = 7;
-            _debounceBtn.Size = new Size(Theme.S(102), Theme.S(28));
-            _debounceBtn.Location = new Point(Theme.S(142), (footer.Height - _debounceBtn.Height) / 2);
+            _debounceBtn.CornerRadius = 6;
+            _debounceBtn.Size = new Size(Theme.S(96), Theme.S(26));
+            _debounceBtn.Location = new Point(Theme.S(126), (footer.Height - _debounceBtn.Height) / 2);
             _debounceBtn.Click += (s, e) => _debounceMenu.Show(_debounceBtn, new Point(0, -_debounceMenu.PreferredSize.Height));
             footer.Controls.Add(_debounceBtn);
 
@@ -3034,9 +3473,9 @@ namespace GameMuteHelper
             _fadeBtn.Text = string.Format("渐变 {0}ms ▾", _config.FadeMs);
             _fadeBtn.Style = PillStyle.Subtle;
             _fadeBtn.Font = Theme.FontSmall;
-            _fadeBtn.CornerRadius = 7;
-            _fadeBtn.Size = new Size(Theme.S(102), Theme.S(28));
-            _fadeBtn.Location = new Point(Theme.S(254), (footer.Height - _fadeBtn.Height) / 2);
+            _fadeBtn.CornerRadius = 6;
+            _fadeBtn.Size = new Size(Theme.S(96), Theme.S(26));
+            _fadeBtn.Location = new Point(Theme.S(230), (footer.Height - _fadeBtn.Height) / 2);
             _fadeBtn.Click += (s, e) => _fadeMenu.Show(_fadeBtn, new Point(0, -_fadeMenu.PreferredSize.Height));
             _tips.SetToolTip(_fadeBtn, "切后台降音量 / 切前台恢复音量的线性过渡时长");
             footer.Controls.Add(_fadeBtn);
@@ -3044,29 +3483,31 @@ namespace GameMuteHelper
             PillButton logBtn = new PillButton();
             logBtn.Text = "数据目录";
             logBtn.Style = PillStyle.Ghost;
+            logBtn.CornerRadius = 6;
             logBtn.Font = Theme.FontSmall;
-            logBtn.Size = new Size(Theme.S(78), Theme.S(28));
-            logBtn.Location = new Point(Theme.S(366), (footer.Height - logBtn.Height) / 2);
+            logBtn.Size = new Size(Theme.S(70), Theme.S(26));
+            logBtn.Location = new Point(Theme.S(334), (footer.Height - logBtn.Height) / 2);
             logBtn.Click += (s, e) => { try { Process.Start("explorer.exe", AppLogger.DataDir); } catch { } };
             footer.Controls.Add(logBtn);
 
             _hideBtn = new PillButton();
             _hideBtn.Text = "收起托盘";
             _hideBtn.Style = PillStyle.Subtle;
+            _hideBtn.CornerRadius = 6;
             _hideBtn.Font = Theme.FontSmall;
-            _hideBtn.Size = new Size(Theme.S(88), Theme.S(28));
-            _hideBtn.Location = new Point(w - Theme.S(110), (footer.Height - _hideBtn.Height) / 2);
+            _hideBtn.Size = new Size(Theme.S(78), Theme.S(26));
+            _hideBtn.Location = new Point(w - Theme.S(98), (footer.Height - _hideBtn.Height) / 2);
             _hideBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _hideBtn.Click += (s, e) => Hide();
             footer.Controls.Add(_hideBtn);
 
             _footerStatus = new Label();
             _footerStatus.Font = Theme.FontSmall;
-            _footerStatus.ForeColor = Theme.TextMuted;
+            _footerStatus.ForeColor = Theme.TextDim;
             _footerStatus.AutoEllipsis = true;
             _footerStatus.TextAlign = ContentAlignment.MiddleRight;
-            _footerStatus.Location = new Point(Theme.S(456), Theme.S(17));
-            _footerStatus.Size = new Size(Math.Max(Theme.S(80), w - Theme.S(580)), Theme.S(20));
+            _footerStatus.Location = new Point(Theme.S(414), Theme.S(13));
+            _footerStatus.Size = new Size(Math.Max(Theme.S(80), w - Theme.S(522)), Theme.S(20));
             _footerStatus.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
             _footerStatus.Text = "更改将自动保存并即时生效";
             footer.Controls.Add(_footerStatus);
@@ -3076,7 +3517,7 @@ namespace GameMuteHelper
             _cardsHost.Dock = DockStyle.Fill;
             _cardsHost.AutoScroll = true;
             _cardsHost.BackColor = Theme.Bg;
-            _cardsHost.Padding = new Padding(Theme.S(22), Theme.S(4), Theme.S(22), Theme.S(14));
+            _cardsHost.Padding = new Padding(Theme.S(20), Theme.S(4), Theme.S(20), Theme.S(14));
             _cardsHost.Resize += (s, e) => ResizeCards();
 
             _emptyLabel = new Label();
@@ -3170,7 +3611,27 @@ namespace GameMuteHelper
                                     else kv.Value.Dispose(); // 已有缓存（并发扫描竞态），丢弃重复
                                 }
                             }
-                            if (_tabs != null && _tabs.SelectedIndex == 1) RebuildCardList();
+                            if (_tabs != null && _tabs.SelectedIndex == 1)
+                            {
+                                RebuildCardList();
+                            }
+                            else if (_tabs != null && _tabs.SelectedIndex == 0)
+                            {
+                                // 已接管标签页：原地回填扫描到的窗口标题与图标，不重建卡片
+                                for (int i = 0; i < _visibleCards.Count; i++)
+                                {
+                                    AppCardControl card = _visibleCards[i];
+                                    string title;
+                                    if (_runningTitles.TryGetValue(card.ProcessName, out title))
+                                        card.UpdateTitle(title);
+                                    Image ico = null;
+                                    lock (_iconCacheSync)
+                                    {
+                                        if (_iconCache.ContainsKey(card.ProcessName)) ico = _iconCache[card.ProcessName];
+                                    }
+                                    if (ico != null) card.UpdateIcon(ico);
+                                }
+                            }
                         }
                     });
                 }
@@ -3241,18 +3702,25 @@ namespace GameMuteHelper
             _tabs.SetLabels(string.Format("已接管 ({0})", _rules.Count), "运行中");
             string q = _searchInput.Query.ToLowerInvariant();
             bool managedTab = (_tabs.SelectedIndex == 0);
+            bool resetScroll = (_lastViewIndex != _tabs.SelectedIndex) || !string.Equals(_lastSearchQuery, q, StringComparison.Ordinal);
 
-            // 软刷新：运行中标签页、无搜索词、卡片集合无增删时，
+            // 软刷新：运行中标签页、无搜索词、卡片集合与接管状态均无变化时，
             // 只原地更新标题与状态，不销毁卡片（保滚动位置与编辑状态）
-            if (!managedTab && string.IsNullOrEmpty(q) && TrySoftRefreshRunningCards()) return;
+            if (!managedTab && string.IsNullOrEmpty(q) && TrySoftRefreshRunningCards())
+            {
+                _lastViewIndex = _tabs.SelectedIndex;
+                _lastSearchQuery = q;
+                return;
+            }
+
+            // WinForms AutoScroll 面板在滚动非 0 时添加子控件会以当前视口偏移为基准，
+            // 必须先保存滚动量、归零后再布局，最后恢复滚动量，否则顶部会出现大片空白。
+            int savedScrollY = resetScroll ? 0 : Math.Max(0, -_cardsHost.AutoScrollPosition.Y);
+            _lastViewIndex = _tabs.SelectedIndex;
+            _lastSearchQuery = q;
 
             _cardsHost.SuspendLayout();
-            // 标签切换时重置滚动到顶部；同标签内重建（如改设置）保留滚动位置
-            if (_lastViewIndex != _tabs.SelectedIndex)
-            {
-                _cardsHost.AutoScrollPosition = new Point(0, 0);
-                _lastViewIndex = _tabs.SelectedIndex;
-            }
+            _cardsHost.AutoScrollPosition = new Point(0, 0);
             for (int i = 0; i < _visibleCards.Count; i++)
             {
                 _cardsHost.Controls.Remove(_visibleCards[i]);
@@ -3273,9 +3741,9 @@ namespace GameMuteHelper
                     .ToList();
             }
 
-            int padX = Theme.S(22);
-            int y = Theme.S(4);
-            int cardW = Math.Max(Theme.S(300), _cardsHost.ClientSize.Width - padX * 2 - SystemInformation.VerticalScrollBarWidth);
+            int padX = Theme.S(20);
+            int y = Theme.S(2);
+            int cardW = Math.Max(Theme.S(300), _cardsHost.ClientSize.Width - padX * 2);
 
             for (int i = 0; i < names.Count; i++)
             {
@@ -3298,7 +3766,7 @@ namespace GameMuteHelper
 
                 if (managedTab)
                 {
-                    card.RuleChanged += OnRuleChanged;
+                    card.LimitRuleChanged += OnLimitRuleChanged;
                     card.AudioRuleChanged += OnAudioRuleChanged;
                     card.RemoveClicked += OnRemoveRule;
                 }
@@ -3310,7 +3778,7 @@ namespace GameMuteHelper
                 ApplyCardStatus(card);
                 _cardsHost.Controls.Add(card);
                 _visibleCards.Add(card);
-                y += card.Height + Theme.S(8);
+                y += card.Height + Theme.S(6);
             }
 
             if (_visibleCards.Count == 0)
@@ -3325,21 +3793,26 @@ namespace GameMuteHelper
                 _emptyLabel.Visible = false;
             }
 
-            _cardsHost.ResumeLayout();
+            _cardsHost.ResumeLayout(true);
             ResizeCards();
+            if (savedScrollY > 0 && _cardsHost.VerticalScroll.Visible)
+            {
+                int maxDown = Math.Max(0, _cardsHost.VerticalScroll.Maximum - _cardsHost.VerticalScroll.LargeChange + 1);
+                _cardsHost.AutoScrollPosition = new Point(0, Math.Min(savedScrollY, maxDown));
+            }
         }
 
-        // 运行中标签页软刷新：卡片集合未变时返回 true（调用方无需重建）
+        // 运行中标签页软刷新：卡片集合与接管状态均未变时返回 true（调用方无需重建）
         private bool TrySoftRefreshRunningCards()
         {
             if (_visibleCards.Count == 0) return false;
 
-            // 关键：卡片必须本来就是「运行中」视图构建的。
-            // 从「已接管」标签切过来时集合可能恰好相同，但卡片上还是接管的控件，
-            // 此时软刷新会保留旧卡片不重建，界面看起来「切换后前面有个项不变」。
+            // 卡片必须本来就是「运行中」视图构建的，且每张卡片的「是否已接管」状态与当前规则一致
             for (int i = 0; i < _visibleCards.Count; i++)
             {
-                if (_visibleCards[i].IsManagedView) return false;
+                AppCardControl card = _visibleCards[i];
+                if (card.IsManagedView) return false;
+                if (card.IsAlreadyManaged != _rules.ContainsKey(card.ProcessName)) return false;
             }
 
             // 集合一致性检查：现卡片与最新扫描的进程名集合必须完全一致（顺序无关）
@@ -3352,13 +3825,19 @@ namespace GameMuteHelper
                 if (!current.Contains(k)) return false;
             }
 
-            // 原地更新：标题 + 状态徽章
+            // 原地更新：标题 + 图标 + 状态徽章
             for (int i = 0; i < _visibleCards.Count; i++)
             {
                 AppCardControl card = _visibleCards[i];
                 string title;
                 _runningTitles.TryGetValue(card.ProcessName, out title);
                 card.UpdateTitle(title ?? "");
+                Image ico = null;
+                lock (_iconCacheSync)
+                {
+                    if (_iconCache.ContainsKey(card.ProcessName)) ico = _iconCache[card.ProcessName];
+                }
+                if (ico != null) card.UpdateIcon(ico);
                 ApplyCardStatus(card);
             }
             return true;
@@ -3366,9 +3845,9 @@ namespace GameMuteHelper
 
         private void ResizeCards()
         {
-            int padX = Theme.S(22);
-            int scrollbar = _cardsHost.VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0;
-            int w = Math.Max(Theme.S(300), _cardsHost.ClientSize.Width - padX * 2 - scrollbar);
+            int padX = Theme.S(20);
+            // ClientSize.Width 已自动扣除垂直滚动条宽度，不再重复扣除
+            int w = Math.Max(Theme.S(300), _cardsHost.ClientSize.Width - padX * 2);
             for (int i = 0; i < _visibleCards.Count; i++)
             {
                 _visibleCards[i].Width = w;
@@ -3380,6 +3859,12 @@ namespace GameMuteHelper
 
         private void ApplyCardStatus(AppCardControl card)
         {
+            if (_paused && card.IsManagedView)
+            {
+                card.SetStatus("已暂停", Theme.TextMuted, Theme.InputBg);
+                return;
+            }
+
             string st;
             if (_liveState.ContainsKey(card.ProcessName))
             {
@@ -3402,14 +3887,13 @@ namespace GameMuteHelper
                 card.SetStatus(st, Theme.TextMuted, Theme.InputBg);
         }
 
-        private void OnRuleChanged(string procName, bool mute, bool limitFps, int value, string method, bool suspendFallbackCpu)
+        private void OnLimitRuleChanged(string procName, bool limitFps, int value, string method, bool suspendFallbackCpu)
         {
             if (!_rules.ContainsKey(procName)) return;
             AppRule r = _rules[procName];
             string newMethod = LimitMethods.Normalize(method);
             bool methodChanged = !newMethod.Equals(LimitMethods.Normalize(r.Method), StringComparison.OrdinalIgnoreCase);
 
-            r.Mute = mute;
             r.Method = newMethod;
             r.Fps = LimitMethods.Clamp(newMethod, value);
             r.LimitFps = limitFps;
@@ -3417,15 +3901,24 @@ namespace GameMuteHelper
             bool fallbackChanged = oldFallback != suspendFallbackCpu;
             r.SuspendFallbackCpu = suspendFallbackCpu;
 
-            // 只有方式/回退设置变化才重置临时回退；改音量等无关操作不应重新触发挂起失败
+            // 只有方式/回退设置变化才重置临时回退
             if (methodChanged || fallbackChanged) _fallbackFromSuspend.Remove(procName);
 
             // 切换限帧方式或关闭限帧时，解除旧方式的干预
             if (methodChanged || !r.LimitFps) RestoreRuleLimits(procName);
 
             SaveState();
-            SetFooterMessage(string.Format("已更新 {0} 配置（{1}{2}）", procName, LimitMethods.ShortLabel(r.Method),
-                newMethod == LimitMethods.Suspend ? (suspendFallbackCpu ? " · 失败回退CPU" : " · 不回退") : ""));
+            if (!r.LimitFps)
+            {
+                SetFooterMessage(string.Format("已关闭 {0} 后台限帧", procName));
+            }
+            else
+            {
+                SetFooterMessage(string.Format("已更新 {0} 限帧（{1} {2}{3}）", procName,
+                    LimitMethods.ShortLabel(r.Method),
+                    LimitMethods.DisplayValue(r.Method, r.Fps),
+                    newMethod == LimitMethods.Suspend ? (suspendFallbackCpu ? " · 失败回退CPU" : " · 不回退") : ""));
+            }
         }
 
         private void OnAudioRuleChanged(string procName, bool audioOn, string audioMode, int volumePercent)
@@ -3678,6 +4171,8 @@ namespace GameMuteHelper
                 if (!procsByName.TryGetValue(name, out pids))
                 {
                     _inactiveSince.Remove(name);
+                    _fallbackFromSuspend.Remove(name);
+                    _suspendWarned.Remove(name);
                     _liveState[name] = "未运行";
                     continue;
                 }
@@ -3736,14 +4231,14 @@ namespace GameMuteHelper
                                 track.WasVolume = s.Volume;
                                 track.CurrentLevel = -1f;
 
-                                // 会话重建（模拟器/游戏关闭重开）：新会话会带着我们上次干预的状态
-                                // （静音或降过的音量）出现。**绝不能把被污染的状态当原值**，
-                                // 否则恢复时只会写回静音/降后值，永远卡住。
+                                // 会话重建（模拟器/游戏关闭重开）：仅当同 PID 有存活记录，或本程序之前
+                                // 确实干预过该应用且尚未清理时，才从快照继承真原值；
+                                // 首次接管时必须尊重用户在音量合成器里自设的音量（如 50%），绝不强行改成 100%。
                                 AudioTrack legacy = FindTrackByPid(s.Pid);
                                 OriginalSnapshot snapshot;
                                 bool hasSnapshot = _lastGoodOriginal.TryGetValue(name, out snapshot)
                                     && (now - snapshot.TimeUtc).TotalMinutes <= OriginalSnapshotTtlMinutes;
-                                bool stateSuspicious = s.Muted || s.Volume + 0.005f < 0.9f; // 静音或音量明显非 100%
+                                bool stateSuspicious = s.Muted || (hasSnapshot && s.Volume + 0.005f < snapshot.Volume);
 
                                 if (legacy != null && !legacy.IsStale())
                                 {
@@ -3766,15 +4261,13 @@ namespace GameMuteHelper
                                         track.CurrentLevel = s.Volume;
                                     }
                                 }
-                                else if (stateSuspicious && hasSnapshot)
+                                else if (stateSuspicious && hasSnapshot && snapshot.Intervened)
                                 {
-                                    // 进程重启后的新会话带着污染状态：用记住的真原值，
+                                    // 进程重启后的新会话带着本程序上次的干预残留：用记住的真原值，
                                     // 并把当前状态识别为干预残留，这样恢复才能真正解除。
                                     track.WasMuted = snapshot.Muted;
                                     track.WasVolume = snapshot.Volume;
-                                    // 静音和低音量是两个独立维度，必须分别标记，
-                                    // 否则只解除其中一个，另一个永久卡住
-                                    if (s.Muted) track.WeMuted = true;
+                                    if (s.Muted && !track.WasMuted) track.WeMuted = true;
                                     if (s.Volume + 0.005f < track.WasVolume)
                                     {
                                         track.Attenuated = true;
@@ -3785,22 +4278,6 @@ namespace GameMuteHelper
                                         "Session restart with stale audio state: pid={0} muted={1} vol={2:0.00} -> restore to {3:0.00}",
                                         s.Pid, s.Muted, s.Volume, snapshot.Volume), "INFO");
                                 }
-                                else if (stateSuspicious)
-                                {
-                                    // 无可信快照：默认原值 = 未静音、100%，当前状态视为干预残留
-                                    track.WasMuted = false;
-                                    track.WasVolume = 1f;
-                                    if (s.Muted) track.WeMuted = true;
-                                    if (s.Volume + 0.005f < track.WasVolume)
-                                    {
-                                        track.Attenuated = true;
-                                        track.AppliedPct = (int)Math.Round(s.Volume * 100);
-                                        track.CurrentLevel = s.Volume;
-                                    }
-                                    AppLogger.Log(string.Format(
-                                        "Session restart, no snapshot: pid={0} treating current state as leftover", s.Pid), "INFO");
-                                }
-                                // 干净状态（100% 且未静音）：原值就是当前值，正常建记录
 
                                 _audioByUs[s.InstanceId] = track;
                             }
@@ -3808,17 +4285,15 @@ namespace GameMuteHelper
                             track.LastSeenUtc = now;
 
                             // 原值可信时记入快照：供进程重启后新会话恢复使用
+                            OriginalSnapshot curSnap;
+                            if (!_lastGoodOriginal.TryGetValue(name, out curSnap))
                             {
-                                OriginalSnapshot snap;
-                                if (!_lastGoodOriginal.TryGetValue(name, out snap))
-                                {
-                                    snap = new OriginalSnapshot();
-                                    _lastGoodOriginal[name] = snap;
-                                }
-                                snap.Muted = track.WasMuted;
-                                snap.Volume = track.WasVolume;
-                                snap.TimeUtc = now;
+                                curSnap = new OriginalSnapshot();
+                                _lastGoodOriginal[name] = curSnap;
                             }
+                            curSnap.Muted = track.WasMuted;
+                            curSnap.Volume = track.WasVolume;
+                            curSnap.TimeUtc = now;
 
                             if (attenuate)
                             {
@@ -3830,13 +4305,15 @@ namespace GameMuteHelper
                                 }
                                 if (!track.WasMuted)
                                 {
-                                    float target = wantPct / 100f;
+                                    // 后台目标音量不超过原始音量，避免原本更小声的应用切后台反而变大声
+                                    float target = Math.Min(track.WasVolume, wantPct / 100f);
                                     if (!track.Attenuated)
                                     {
-                                        // 首次降音量：从会话当前音量线性渐变到目标（约 1 秒）
+                                        // 首次降音量：从会话当前音量线性渐变到目标
                                         float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
                                         track.Attenuated = true;
                                         track.AppliedPct = wantPct;
+                                        curSnap.Intervened = true;
                                         if (Math.Abs(from - target) < 0.005f)
                                         {
                                             track.CurrentLevel = target;
@@ -3855,6 +4332,7 @@ namespace GameMuteHelper
                                     {
                                         // 回前台渐变中途又切回后台：从当前值折返向下
                                         track.AppliedPct = wantPct;
+                                        curSnap.Intervened = true;
                                         float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
                                         if (Math.Abs(from - target) >= 0.005f)
                                         {
@@ -3875,6 +4353,7 @@ namespace GameMuteHelper
                                     {
                                         // 后台期间调整目标百分比：从当前值渐变到新目标
                                         track.AppliedPct = wantPct;
+                                        curSnap.Intervened = true;
                                         float from = track.CurrentLevel >= 0f ? track.CurrentLevel : s.Volume;
                                         if (track.Fade == FadeKind.Down)
                                         {
@@ -3928,6 +4407,7 @@ namespace GameMuteHelper
                                     if (MuteCore.SetMute(s.InstanceId, true))
                                     {
                                         track.WeMuted = true;
+                                        curSnap.Intervened = true;
                                         SetFooterMessage(name + " 切至后台 · 已静音");
                                     }
                                 }
@@ -3936,29 +4416,34 @@ namespace GameMuteHelper
                         }
                         else
                         {
-                            // 前台：若该会话没有我们的记录，但状态可疑（模拟器重启后
-                            // 带着上次的静音/30% 出现），主动恢复到真原值，
-                            // 否则用户看到的就是「怎么切都没用」的卡死状态
-                            if (!_audioByUs.ContainsKey(s.InstanceId))
+                            // 前台：仅当本应用开启音频接管且曾被我们干预过，才清理重启后可能残留的静音/低音量；
+                            // 绝不干涉用户在系统音量合成器里手动静音或调低的程序。
+                            if (rule.Mute && active && !_audioByUs.ContainsKey(s.InstanceId))
                             {
                                 OriginalSnapshot snap;
                                 bool hasSnap = _lastGoodOriginal.TryGetValue(name, out snap)
+                                    && snap.Intervened
                                     && (now - snap.TimeUtc).TotalMinutes <= OriginalSnapshotTtlMinutes;
-                                bool polluted = s.Muted || (hasSnap && s.Volume + 0.005f < snap.Volume);
+                                bool polluted = hasSnap && ((s.Muted && !snap.Muted) || s.Volume + 0.005f < snap.Volume);
                                 if (polluted && !string.IsNullOrEmpty(s.InstanceId))
                                 {
-                                    float target = hasSnap ? snap.Volume : 1f;
-                                    bool okMute = !s.Muted || MuteCore.SetMute(s.InstanceId, false);
+                                    float target = snap.Volume;
+                                    bool okMute = (!s.Muted || snap.Muted) || MuteCore.SetMute(s.InstanceId, snap.Muted);
                                     bool okVol = Math.Abs(s.Volume - target) < 0.005f || MuteCore.SetVolume(s.InstanceId, target);
                                     if (okMute && okVol)
                                     {
+                                        snap.Intervened = false;
                                         AppLogger.Log(string.Format(
                                             "Cleared leftover audio state on foreground: pid={0} -> vol={1:0.00}",
                                             s.Pid, target), "INFO");
                                     }
                                 }
                             }
-                            RestoreSessionAudio(s.InstanceId, name, "前台", AfterUpKind.RemoveRecord, s.Volume, s.Muted);
+                            if (RestoreSessionAudio(s.InstanceId, name, "前台", AfterUpKind.RemoveRecord, s.Volume, s.Muted))
+                            {
+                                OriginalSnapshot snap;
+                                if (_lastGoodOriginal.TryGetValue(name, out snap)) snap.Intervened = false;
+                            }
                         }
                     }
                 }
@@ -4112,7 +4597,13 @@ namespace GameMuteHelper
             foreach (KeyValuePair<string, AudioTrack> kv in _audioByUs)
             {
                 if (alive.Contains(kv.Key)) continue;                       // 会话还活着
-                if (kv.Value.LastSeenUtc >= staleCutoff) continue;           // 短暂消失，再等等
+                // 所属进程已退出：立即清理记录，不拖延 30 秒导致托盘一直显示节流中
+                if (kv.Value.Pid > 0 && !livePids.Contains((int)kv.Value.Pid))
+                {
+                    expired.Add(kv.Key);
+                    continue;
+                }
+                if (kv.Value.LastSeenUtc >= staleCutoff) continue;           // 进程仍存活但会话短暂消失，再等等
                 expired.Add(kv.Key);                                        // 彻底过期才放弃
             }
             for (int i = 0; i < expired.Count; i++)
@@ -4152,6 +4643,7 @@ namespace GameMuteHelper
             {
                 string id = fading[i].Key;
                 AudioTrack t = fading[i].Value;
+                if (now < t.FadeRetryAfterUtc) continue;
 
                 double progress = (now - t.FadeStartUtc).TotalMilliseconds / EffectiveFadeMs;
                 if (progress > 1.0) progress = 1.0;
@@ -4164,9 +4656,10 @@ namespace GameMuteHelper
                 }
                 else
                 {
-                    // 写入失败（会话短暂消失/COM 忙）：从当前实际位置重新起算
-                    t.FadeFrom = level;
+                    // 写入失败（会话短暂消失/COM 忙）：保留真实进度并退避 500ms，避免高频刷 COM
+                    t.FadeFrom = t.CurrentLevel >= 0f ? t.CurrentLevel : t.FadeFrom;
                     t.FadeStartUtc = now;
+                    t.FadeRetryAfterUtc = now.AddMilliseconds(500);
                     continue;
                 }
 
@@ -4197,6 +4690,9 @@ namespace GameMuteHelper
                     {
                         t.WeMuted = false;
                         _audioByUs.Remove(id);
+                        OriginalSnapshot snap;
+                        if (!string.IsNullOrEmpty(t.AppName) && _lastGoodOriginal.TryGetValue(t.AppName, out snap))
+                            snap.Intervened = false;
                         SetFooterMessage((string.IsNullOrEmpty(t.AppName) ? "应用" : t.AppName) + " · 音量已恢复");
                     }
                 }
@@ -4419,11 +4915,16 @@ namespace GameMuteHelper
                 RestoreAllMuted();
                 RestoreAllLimits();
                 _inactiveSince.Clear();
+                _liveState.Clear();
                 SetFooterMessage("已暂停监控，并恢复所有音量与帧率");
             }
             else
             {
                 SetFooterMessage("已恢复后台监控");
+            }
+            if (Visible)
+            {
+                for (int i = 0; i < _visibleCards.Count; i++) ApplyCardStatus(_visibleCards[i]);
             }
             UpdateHeaderAndTray();
         }
@@ -4463,9 +4964,9 @@ namespace GameMuteHelper
             ShowInTaskbar = true;
             if (!Visible)
             {
-                ScanRunningProcesses();
                 RebuildCardList();
                 Show();
+                ScanRunningProcesses(); // 放在 Show() 之后，确保窗口句柄已创建，异步回填不丢结果
             }
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Activate();
@@ -4485,11 +4986,27 @@ namespace GameMuteHelper
             _exiting = true;
             AppLogger.Log("Exiting GameMuteHelper.");
             try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { }
-            try { _monitorTimer.Stop(); } catch { }
+            try { if (_monitorTimer != null) { _monitorTimer.Stop(); _monitorTimer.Dispose(); } } catch { }
+            try { if (_fadeTimer != null) { _fadeTimer.Stop(); _fadeTimer.Dispose(); } } catch { }
             try { if (_wheelFilter != null) Application.RemoveMessageFilter(_wheelFilter); } catch { }
             try { RestoreAudio(true); } catch { }
             try { RestoreAllLimits(); } catch { }
-            try { _tray.Visible = false; _tray.Dispose(); } catch { }
+            try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } } catch { }
+            try { if (_debounceMenu != null) _debounceMenu.Dispose(); } catch { }
+            try { if (_fadeMenu != null) _fadeMenu.Dispose(); } catch { }
+            try { if (_tips != null) _tips.Dispose(); } catch { }
+            try { if (_iconActive != null) _iconActive.Dispose(); } catch { }
+            try { if (_iconMuted != null) _iconMuted.Dispose(); } catch { }
+            try { if (_iconPaused != null) _iconPaused.Dispose(); } catch { }
+            try
+            {
+                lock (_iconCacheSync)
+                {
+                    foreach (Image img in _iconCache.Values) { try { img.Dispose(); } catch { } }
+                    _iconCache.Clear();
+                }
+            }
+            catch { }
             Application.Exit();
         }
     }
