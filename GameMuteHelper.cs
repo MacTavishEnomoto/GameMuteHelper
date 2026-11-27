@@ -18,8 +18,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("GameMuteHelper")]
 [assembly: System.Reflection.AssemblyDescription("后台失焦自动静音/降音量与 CPU 配额限帧助手")]
 [assembly: System.Reflection.AssemblyProduct("GameMuteHelper")]
-[assembly: System.Reflection.AssemblyVersion("3.6.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("3.6.0.0")]
+[assembly: System.Reflection.AssemblyVersion("3.6.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("3.6.1.0")]
 
 namespace GameMuteHelper
 {
@@ -95,7 +95,7 @@ namespace GameMuteHelper
 
                 bool debugPriv = ProcessPrivileges.EnableDebugPrivilege();
                 AppLogger.Init();
-                AppLogger.Log(string.Format("Starting GameMuteHelper v3.6 (Admin={0}, Background={1}, 64Bit={2}, SeDebug={3})",
+                AppLogger.Log(string.Format("Starting GameMuteHelper v3.6.1 (Admin={0}, Background={1}, 64Bit={2}, SeDebug={3})",
                     IsAdministrator(), background, Environment.Is64BitProcess, debugPriv));
 
                 MainForm form = new MainForm(showEvent, background, IsAdministrator());
@@ -3215,7 +3215,8 @@ namespace GameMuteHelper
 
             if (startBackground)
             {
-                WindowState = FormWindowState.Minimized;
+                // 后台启动时窗体不会 Show()，保持 WindowState=Normal，
+                // 避免首次 Show() 在 Minimized 状态下以 0x0 尺寸创建句柄导致整个客户区白屏。
                 ShowInTaskbar = false;
             }
         }
@@ -4961,14 +4962,23 @@ namespace GameMuteHelper
 
         private void ShowMainWindow()
         {
-            ShowInTaskbar = true;
+            if (WindowState == FormWindowState.Minimized)
+                WindowState = FormWindowState.Normal;
+            if (!ShowInTaskbar)
+                ShowInTaskbar = true;
             if (!Visible)
             {
-                RebuildCardList();
                 Show();
+                PerformLayout();
+                RebuildCardList();
                 ScanRunningProcesses(); // 放在 Show() 之后，确保窗口句柄已创建，异步回填不丢结果
             }
-            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            else
+            {
+                PerformLayout();
+            }
+            Invalidate(true);
+            Update();
             Activate();
             BringToFront();
         }
